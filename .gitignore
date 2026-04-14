@@ -1,0 +1,41 @@
+# Environment — contains real bot token, never commit
+.env
+
+# Internal development resources (design docs, chat logs)
+internal-resources/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated PDFs — zero-data-retention, should never be committed
+*.pdf
+
+# Downloaded fonts — regenerated via scripts/download_fonts.py
+fonts/*.ttf
+fonts/*.otf
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
