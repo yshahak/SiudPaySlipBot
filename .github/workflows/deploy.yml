@@ -42,5 +42,7 @@ jobs:
           service: ${{ env.SERVICE }}
           region: ${{ env.REGION }}
           image: ${{ env.REGISTRY }}/${{ env.SERVICE }}:${{ github.sha }}
+          env_vars: |
+            WEBHOOK_URL=${{ secrets.WEBHOOK_URL }}
           secrets: |
             TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest
