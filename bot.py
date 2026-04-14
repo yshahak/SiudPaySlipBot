@@ -17,7 +17,8 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -30,8 +31,11 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
 import config
+import database
 from calculator import PayslipInput, calculate, calculate_partial_days
 from pdf_generator import generate_payslip_pdf
 
@@ -246,15 +250,42 @@ def _parse_non_negative_int(text: str) -> int | None:
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
+
+    user_id = message.from_user.id  # type: ignore[union-attr]
+    saved_data: dict | None = None
+    try:
+        saved_data = await database.get_user(user_id)
+    except Exception:
+        log.warning("Firestore get_user failed for %s — continuing without saved data", user_id)
+    await state.update_data(saved_data=saved_data, user_id=user_id)
+
     await message.answer(
         "👋 *ברוכים הבאים למחולל תלושי השכר*\n\n"
         "הבוט מסייע למעסיקי עובדי זר בסיעוד לחשב שכר ולהפיק תלוש שכר רשמי.\n\n"
-        "🔒 *פרטיות:* לא נשמר שום מידע. כל הנתונים נמחקים מיד לאחר שליחת התלוש.\n\n"
+        "🔒 *פרטיות:* מספרי דרכון ונתוני שכר נמחקים מיד. "
+        "שמות ויתרות חופשה/מחלה נשמרים לנוחיותך. "
+        "להסרת כל הנתונים: /forget\\_me\n\n"
         "לאיזה חודש להפיק את התלוש?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=_month_picker_kb(),
     )
     await state.set_state(PayslipForm.month_year)
+
+
+# ── /forget_me command ────────────────────────────────────────────────────────
+
+@router.message(Command("forget_me"))
+async def cmd_forget_me(message: Message) -> None:
+    """Delete all stored data for this user from Firestore."""
+    user_id = message.from_user.id  # type: ignore[union-attr]
+    deleted = await database.delete_user(user_id)
+    if deleted:
+        await message.answer(
+            "✅ כל הנתונים שלך נמחקו מהמערכת.\n"
+            "שמות, יתרת חופשה ויתרת מחלה — הכל נמחק."
+        )
+    else:
+        await message.answer("ℹ️ לא נמצאו נתונים שמורים עבורך.")
 
 
 # ── State: month_year — quick-pick callback ────────────────────────────────────
@@ -308,8 +339,11 @@ async def _confirm_month_and_proceed(
     confirm_text = f"📅 חודש: *{month_name} {year}*\n\nהאם העובד/ת עבד/ה חודש מלא?"
 
     if edit:
-        await message.edit_text(confirm_text, parse_mode=ParseMode.MARKDOWN,  # type: ignore[union-attr]
-                                reply_markup=_work_period_kb())
+        try:
+            await message.edit_text(confirm_text, parse_mode=ParseMode.MARKDOWN,  # type: ignore[union-attr]
+                                    reply_markup=_work_period_kb())
+        except TelegramBadRequest:
+            pass  # message already has this content (stale callback replay) — ignore
     else:
         await message.answer(confirm_text, parse_mode=ParseMode.MARKDOWN,
                              reply_markup=_work_period_kb())
@@ -326,8 +360,7 @@ async def handle_work_period(callback: CallbackQuery, state: FSMContext) -> None
     if period == "full":
         await state.update_data(days_worked=26)
         await callback.message.edit_text("✅ חודש מלא — 26 ימי עבודה.")  # type: ignore[union-attr]
-        await callback.message.answer("מהו שם המעסיק?", reply_markup=_skip_kb())  # type: ignore[union-attr]
-        await state.set_state(PayslipForm.employer_name)
+        await _ask_employer_name(callback.message, state)  # type: ignore[arg-type]
     else:
         await callback.message.edit_text("⚠️ חודש חלקי.")  # type: ignore[union-attr]
         await callback.message.answer(  # type: ignore[union-attr]
@@ -389,14 +422,45 @@ async def handle_partial_day(message: Message, state: FSMContext) -> None:
     month_name = config.HEBREW_MONTHS[month]
     await message.answer(
         f"✅ *{active_days} ימים פעילים* מתוך {days_in_month} ימי חודש {month_name} "
-        f"= *{days_worked} ימי עבודה* מחושבים מתוך 26.\n\nמהו שם המעסיק?",
+        f"= *{days_worked} ימי עבודה* מחושבים מתוך 26.",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_skip_kb(),
     )
-    await state.set_state(PayslipForm.employer_name)
+    await _ask_employer_name(message, state)
 
 
 # ── State: employer_name ───────────────────────────────────────────────────────
+
+async def _ask_employer_name(message: Message, state: FSMContext) -> None:
+    """
+    Prompt for the employer name. If Firestore has saved names for this user,
+    shows an inline button to reuse them and displays the current balance.
+    """
+    data = await state.get_data()
+    saved: dict | None = data.get("saved_data")
+    await state.set_state(PayslipForm.employer_name)
+
+    if saved and saved.get("employer_name", _SKIPPED) != _SKIPPED:
+        employer = saved["employer_name"]
+        caregiver = saved.get("caregiver_name", _SKIPPED)
+        vac = saved.get("vacation_balance", 0.0)
+        sick = saved.get("sick_balance", 0.0)
+        caregiver_display = caregiver if caregiver != _SKIPPED else "לא הוזן"
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text=f"⚡ פרטים קודמים: {employer} / {caregiver_display}",
+            callback_data="use_saved",
+        )
+        builder.button(text="⏭️ דלג", callback_data="skip_field")
+        builder.adjust(1)
+        await message.answer(
+            f"✅ *יתרה צבורה:* {vac:.2f} ימי חופשה | {sick:.2f} ימי מחלה\n\n"
+            "מהו שם המעסיק?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=builder.as_markup(),
+        )
+    else:
+        await message.answer("מהו שם המעסיק?", reply_markup=_skip_kb())
+
 
 @router.callback_query(PayslipForm.employer_name, F.data == "skip_field")
 async def skip_employer_name(callback: CallbackQuery, state: FSMContext) -> None:
@@ -405,6 +469,26 @@ async def skip_employer_name(callback: CallbackQuery, state: FSMContext) -> None
     await callback.message.edit_text("⏭️ שם מעסיק — לא הוזן.")  # type: ignore[union-attr]
     await callback.message.answer("מהו שם המטפל/ת?", reply_markup=_skip_kb())  # type: ignore[union-attr]
     await state.set_state(PayslipForm.caregiver_name)
+
+
+@router.callback_query(PayslipForm.employer_name, F.data == "use_saved")
+async def handle_use_saved(callback: CallbackQuery, state: FSMContext) -> None:
+    """Pre-fill employer + caregiver from Firestore and jump directly to passport."""
+    await callback.answer()
+    data = await state.get_data()
+    saved: dict = data.get("saved_data") or {}
+    employer_name = saved.get("employer_name", _SKIPPED)
+    caregiver_name = saved.get("caregiver_name", _SKIPPED)
+    await state.update_data(employer_name=employer_name, caregiver_name=caregiver_name)
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        f"⚡ נטענו פרטים קודמים:\n"
+        f"מעסיק: {employer_name} | מטפל/ת: {caregiver_name if caregiver_name != _SKIPPED else 'לא הוזן'}"
+    )
+    await callback.message.answer(  # type: ignore[union-attr]
+        "מהו מספר הדרכון של המטפל/ת?",
+        reply_markup=_skip_kb(),
+    )
+    await state.set_state(PayslipForm.passport)
 
 
 @router.message(PayslipForm.employer_name)
@@ -830,6 +914,7 @@ async def _generate_and_send(message: Message, state: FSMContext) -> None:
     """
     data = await state.get_data()
     payslip_input = _build_payslip_input(data)
+    user_id: int = data.get("user_id", message.chat.id)
 
     # Clear FSM state immediately — data leaves memory before PDF is sent
     await state.clear()
@@ -839,6 +924,14 @@ async def _generate_and_send(message: Message, state: FSMContext) -> None:
     except ValueError as exc:
         await message.answer(f"❌ שגיאה בחישוב השכר:\n{exc}\n\nהזן /start להתחלה מחדש.")
         return
+
+    # Fire DB updates in the background — parallel with PDF generation
+    db_upsert = asyncio.create_task(
+        database.upsert_user(user_id, result.employer_name, result.caregiver_name)
+    )
+    db_balances = asyncio.create_task(
+        database.add_to_balances(user_id, result.vacation_accrued, result.sick_accrued)
+    )
 
     await message.answer("⏳ מפיק את התלוש…")
     pdf_path: str | None = None
@@ -850,7 +943,7 @@ async def _generate_and_send(message: Message, state: FSMContext) -> None:
             caption=(
                 f"✅ *תלוש שכר — {month_name} {result.year}*\n"
                 f"סה״כ לתשלום: *{result.total_net_pay:,.2f} ₪*\n\n"
-                "🔒 כל הנתונים נמחקו מהשרת."
+                "🔒 נתוני שכר ודרכון נמחקו מהשרת."
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -861,6 +954,25 @@ async def _generate_and_send(message: Message, state: FSMContext) -> None:
         if pdf_path and os.path.exists(pdf_path):
             os.remove(pdf_path)
             log.info("PDF deleted: %s", pdf_path)
+
+    # Await DB tasks; log failures but do not crash
+    db_results = await asyncio.gather(db_upsert, db_balances, return_exceptions=True)
+    for i, r in enumerate(db_results):
+        if isinstance(r, Exception):
+            log.warning("DB task %d failed: %s", i, r)
+
+    # Show updated balance (best-effort; skipped if Firestore unavailable)
+    try:
+        updated = await database.get_user(user_id)
+        if updated:
+            vac = updated.get("vacation_balance", 0.0)
+            sick = updated.get("sick_balance", 0.0)
+            await message.answer(
+                f"✅ *יתרה עדכנית:* {vac:.2f} ימי חופשה | {sick:.2f} ימי מחלה",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    except Exception:
+        pass
 
     await message.answer("להפקת תלוש נוסף לחץ /start")
 
@@ -875,8 +987,38 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    log.info("Bot starting...")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    try:
+        await database.init_db()
+        log.info("Firestore initialized.")
+    except Exception as exc:
+        log.warning("Firestore unavailable — running without persistence: %s", exc)
+
+    if config.WEBHOOK_URL:
+        webhook_url = f"{config.WEBHOOK_URL}/webhook"
+
+        # Start HTTP server FIRST so Cloud Run's health check passes
+        app = web.Application()
+        SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
+        setup_application(app, dp, bot=bot)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=config.PORT)
+        await site.start()
+        log.info("Webhook server listening on port %d", config.PORT)
+
+        # Register webhook with Telegram — non-fatal so a temporary/wrong URL
+        # doesn't crash the server (we update WEBHOOK_URL once the real URL is known)
+        try:
+            await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
+            log.info("Webhook registered: %s", webhook_url)
+        except Exception as exc:
+            log.warning("Webhook registration failed (update WEBHOOK_URL env var): %s", exc)
+
+        await asyncio.Event().wait()  # run forever until process is killed
+    else:
+        log.info("No WEBHOOK_URL set — starting polling (local dev mode).")
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
