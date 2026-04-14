@@ -991,9 +991,8 @@ async def main() -> None:
 
     if config.WEBHOOK_URL:
         webhook_url = f"{config.WEBHOOK_URL}/webhook"
-        await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
-        log.info("Webhook set: %s", webhook_url)
 
+        # Start HTTP server FIRST so Cloud Run's health check passes
         app = web.Application()
         SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
         setup_application(app, dp, bot=bot)
@@ -1003,6 +1002,15 @@ async def main() -> None:
         site = web.TCPSite(runner, host="0.0.0.0", port=config.PORT)
         await site.start()
         log.info("Webhook server listening on port %d", config.PORT)
+
+        # Register webhook with Telegram — non-fatal so a temporary/wrong URL
+        # doesn't crash the server (we update WEBHOOK_URL once the real URL is known)
+        try:
+            await bot.set_webhook(webhook_url, allowed_updates=["message", "callback_query"])
+            log.info("Webhook registered: %s", webhook_url)
+        except Exception as exc:
+            log.warning("Webhook registration failed (update WEBHOOK_URL env var): %s", exc)
+
         await asyncio.Event().wait()  # run forever until process is killed
     else:
         log.info("No WEBHOOK_URL set — starting polling (local dev mode).")
