@@ -9,7 +9,7 @@ Scenario:
   - active days = 30 - 12 + 1 = 19  →  days_worked = round(19/30 × 26) = 16
   - employer: "מלכה", caregiver: skipped, passport: skipped
   - shabbat=0, holiday=0, pocket_money=0, advances=0
-  - housing deduction selected; amount entered = 118.15 (pro-rata max)
+  - housing deduction selected; amount entered = 118.65 (pro-rata max)
   - no food deduction
 
 Run with:
@@ -67,7 +67,7 @@ def _make_fsm_data(**overrides) -> dict:
         },
         "deductions_pro_rata_max": pro_rata_max,
         "deductions_amounts": {
-            **pro_rata_max,          # housing=118.15, health=104.00, extras=57.85
+            **pro_rata_max,          # housing=118.65, health=104.00, extras=57.85
             "food": "0",
         },
     }
@@ -96,7 +96,7 @@ class TestProRataMaxima:
         expected = (config.DEDUCTION_HOUSING_MAX * self.RATIO).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
-        assert expected == Decimal("118.15")
+        assert expected == Decimal("118.65")
 
     def test_health_pro_rata_max(self):
         expected = (config.DEDUCTION_HEALTH_MAX * self.RATIO).quantize(
@@ -140,7 +140,7 @@ class TestBuildPayslipInput:
 
     def test_housing_deduction_amount(self):
         inp = _build_payslip_input(_make_fsm_data())
-        assert inp.deduction_housing == Decimal("118.15")
+        assert inp.deduction_housing == Decimal("118.65")
 
     def test_unselected_deductions_are_zero(self):
         inp = _build_payslip_input(_make_fsm_data())
@@ -179,10 +179,10 @@ class TestCalculateForScenario:
         assert self.result.total_gross == self.result.gross_base
 
     def test_total_deductions(self):
-        assert self.result.total_deductions == Decimal("118.15")
+        assert self.result.total_deductions == Decimal("118.65")
 
     def test_net_pay(self):
-        assert self.result.total_net_pay == self.result.total_gross - Decimal("118.15")
+        assert self.result.total_net_pay == self.result.total_gross - Decimal("118.65")
 
     def test_deductions_under_25pct_cap(self):
         ratio = self.result.total_deductions / self.result.total_gross
@@ -269,7 +269,7 @@ class TestConfirmSummaryText:
         assert "3,965.45" in self._build_summary()
 
     def test_summary_contains_housing_deduction(self):
-        assert "118.15" in self._build_summary()
+        assert "118.65" in self._build_summary()
 
     def test_summary_contains_net_pay(self):
         result = calculate(_build_payslip_input(_make_fsm_data()))

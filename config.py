@@ -49,10 +49,26 @@ def get_wage_params(month: int, year: int) -> tuple[Decimal, Decimal]:
     return min_wage, shabbat_rate
 
 
+# ── Housing Deduction Caps by Region — April 2026 (employer-owned property) ───
+# Source: siud.pirsuma.com/calc_nikuyim/
+# These are the "owned by employer" caps. Rented property caps are exactly 2×.
+HOUSING_CAPS_OWNED: dict[str, Decimal] = {
+    "tel_aviv":   Decimal("289.18"),
+    "jerusalem":  Decimal("254.31"),
+    "center":     Decimal("192.81"),
+    "south":      Decimal("171.40"),
+    "north":      Decimal("157.71"),
+}
+HOUSING_CAPS_RENTED: dict[str, Decimal] = {
+    k: v * 2 for k, v in HOUSING_CAPS_OWNED.items()
+}
+
 # ── Permitted Deduction Maximums (reflect April 2026 values) ──────────────────
 # Source: siud.pirsuma.com/calc_nikuyim/
 # All deductions require written worker consent (Appendix C of standard contract).
-DEDUCTION_HOUSING_MAX = Decimal("192")     # מגורים הולמים
+# DEDUCTION_HOUSING_MAX is the fallback/default (Center region, owned) used when
+# no region has been configured yet.
+DEDUCTION_HOUSING_MAX = HOUSING_CAPS_OWNED["center"]  # ₪192.81 — Center / Haifa
 DEDUCTION_HEALTH_MAX = Decimal("169")      # ביטוח רפואי
 DEDUCTION_EXTRAS_MAX = Decimal("94")       # הוצאות נלוות
 DEDUCTION_FOOD_MAX = Decimal("644")        # כלכלה — 10% of April 2026 min wage

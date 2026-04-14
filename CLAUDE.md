@@ -26,7 +26,7 @@ Community open-source tool. Primary users: private individuals with no payroll b
 | `scripts/generate_sample.py` | Visual PDF inspection; does NOT delete the file (unlike bot.py) |
 | `tests/test_calculator.py` | 30 pytest unit tests; pure math, no mocking |
 
-Do not mix these concerns. `calculator.py` must remain importable with no side effects.
+Do not mix these concern׳קךךs. `calculator.py` must remain importable with no side effects.
 
 ---
 
