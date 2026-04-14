@@ -17,6 +17,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -338,8 +339,11 @@ async def _confirm_month_and_proceed(
     confirm_text = f"📅 חודש: *{month_name} {year}*\n\nהאם העובד/ת עבד/ה חודש מלא?"
 
     if edit:
-        await message.edit_text(confirm_text, parse_mode=ParseMode.MARKDOWN,  # type: ignore[union-attr]
-                                reply_markup=_work_period_kb())
+        try:
+            await message.edit_text(confirm_text, parse_mode=ParseMode.MARKDOWN,  # type: ignore[union-attr]
+                                    reply_markup=_work_period_kb())
+        except TelegramBadRequest:
+            pass  # message already has this content (stale callback replay) — ignore
     else:
         await message.answer(confirm_text, parse_mode=ParseMode.MARKDOWN,
                              reply_markup=_work_period_kb())
