@@ -14,4 +14,6 @@ RUN python scripts/download_fonts.py
 
 ENV PYTHONUNBUFFERED=1
 
+EXPOSE 8080
+
 CMD ["python", "bot.py"]
