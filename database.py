@@ -75,6 +75,38 @@ async def upsert_user(user_id: int, employer_name: str, caregiver_name: str) -> 
         log.warning("upsert_user(%s) failed: %s", user_id, exc)
 
 
+async def upsert_contract(
+    user_id: int,
+    base_housing: Decimal,
+    base_health: Decimal,
+    base_extras: Decimal,
+    region: str | None = None,
+    ownership: str | None = None,
+    employment_start_date: str | None = None,
+) -> None:
+    """
+    Save/overwrite the user's full-month contract deduction baselines, housing
+    region/ownership type, and employment start date (ISO string "YYYY-MM-DD").
+    """
+    if _db is None:
+        return
+    try:
+        data: dict = {
+            "base_housing": float(base_housing),
+            "base_health":  float(base_health),
+            "base_extras":  float(base_extras),
+        }
+        if region is not None:
+            data["contract_region"] = region
+        if ownership is not None:
+            data["contract_ownership"] = ownership
+        if employment_start_date is not None:
+            data["employment_start_date"] = employment_start_date
+        await _get_db().collection(COLLECTION).document(str(user_id)).set(data, merge=True)
+    except Exception as exc:
+        log.warning("upsert_contract(%s) failed: %s", user_id, exc)
+
+
 async def add_to_balances(user_id: int, vacation_delta: Decimal, sick_delta: Decimal) -> None:
     """
     Increment the accumulated vacation and sick balances for this user.
