@@ -16,6 +16,12 @@ load_dotenv()
 # ── Telegram ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 
+# ── Cloud Run / Webhook ────────────────────────────────────────────────────────
+# Set WEBHOOK_URL to enable webhook mode (required for Cloud Run).
+# Leave unset for local polling mode.
+WEBHOOK_URL: str | None = os.environ.get("WEBHOOK_URL")  # e.g. "https://my-service.run.app"
+PORT: int = int(os.environ.get("PORT", "8080"))
+
 # ── Labor Law: Minimum Wage History ───────────────────────────────────────────
 # Each entry: (effective_from, min_monthly_gross, shabbat_holiday_daily_rate)
 # Source: siud.pirsuma.com/min_2026/, Israeli Ministry of Labor official data.
