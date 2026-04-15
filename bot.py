@@ -48,11 +48,14 @@ router = Router()
 # ── Global error handler ───────────────────────────────────────────────────────
 
 @router.error()
-async def global_error_handler(event: ErrorEvent) -> None:
+async def global_error_handler(event: ErrorEvent, bot: Bot) -> None:
     """
     Catch any unhandled exception from a handler, log it, and notify the user.
     Without this, aiogram silently swallows exceptions — the user sees nothing
     and the bot appears stuck.
+
+    Bot is injected by aiogram's DI system — do NOT use event.update.bot
+    (that attribute does not exist in aiogram v3).
     """
     log.exception("Unhandled exception in handler: %s", event.exception)
 
@@ -68,8 +71,6 @@ async def global_error_handler(event: ErrorEvent) -> None:
 
     if chat_id:
         try:
-            # Re-use the bot instance from the running application
-            bot: Bot = event.update.bot  # type: ignore[attr-defined]
             await bot.send_message(
                 chat_id,
                 "❌ אירעה שגיאה בלתי צפויה.\nאנא הזן /start להתחלה מחדש.",
@@ -85,26 +86,27 @@ class PayslipForm(StatesGroup):
     work_period = State()       # inline keyboard: full / partial
     partial_type = State()      # started mid-month or ended mid-month
     partial_day = State()       # which calendar day (1-31)
+    details_confirm = State()   # fast-track: confirm saved employer+caregiver in one step
     employer_name = State()
     caregiver_name = State()
     passport = State()
-    shabbat_days = State()
-    holiday_days = State()
-    pocket_money_weeks = State()
-    advances = State()
-    deductions = State()        # inline multi-select (amounts shown inline)
-    deduction_edit = State()    # editing a single deduction amount in-place
+    shabbat_days = State()      # days worked on Shabbat (added on top of base salary)
+    holiday_days = State()      # days worked on national holidays
+    # ARCHITECTURE NOTE (Simple Mode): pocket_money_weeks, deductions, and deduction_edit
+    # states are bypassed. All are set to 0 automatically.
+    # Re-enable these states for Detailed Mode when per-item deduction UI is needed.
+    advances = State()          # cash advances already paid this month
     confirm = State()           # summary review before PDF generation
 
 
 class ContractSetupForm(StatesGroup):
     """One-time (or /setup-triggered) flow to collect persistent caregiver/contract config."""
-    review         = State()   # /setup only: show current values + confirm update
-    region         = State()   # inline: region of residence
-    ownership_type = State()   # inline: employer-owned vs rented
-    housing        = State()
-    health         = State()
-    extras         = State()
+    review           = State()   # /setup only: show current values + confirm update
+    agreed_net_salary = State()  # monthly net salary agreed in the contract
+    rest_day         = State()   # weekly rest day: friday / saturday / sunday
+    # ARCHITECTURE NOTE (Simple Mode): region, ownership_type, housing, health, extras
+    # states are bypassed. Re-enable for Detailed Mode when per-item deduction setup
+    # is needed.
     start_date     = State()   # employment start date (DD/MM/YYYY or MM/YYYY)
     employer_name  = State()   # optional: employer name for payslips
     caregiver_name = State()   # optional: caregiver name for payslips
@@ -167,44 +169,11 @@ def _skip_kb() -> InlineKeyboardMarkup:
 # Placeholder stored when the user skips an optional personal-details field.
 _SKIPPED = "---"
 
-# Fixed deduction keys, labels, and their legal config maxima.
-# Ordered as they appear in the conversation.
-_DEDUCTION_META: dict[str, tuple[str, Decimal]] = {
-    "housing": ("מגורים",        config.DEDUCTION_HOUSING_MAX),
-    "health":  ("ביטוח רפואי",   config.DEDUCTION_HEALTH_MAX),
-    "extras":  ("הוצאות נלוות",  config.DEDUCTION_EXTRAS_MAX),
-}
-
-
-def _deduction_edit_kb(
-    max_amount: Decimal, prorata_amount: Decimal | None = None
-) -> InlineKeyboardMarkup:
-    """Keyboard shown while editing a single deduction amount in-place."""
-    builder = InlineKeyboardBuilder()
-    if prorata_amount is not None:
-        builder.button(
-            text=f"⚡ השתמש בסכום היחסי: ₪{prorata_amount:,.2f}",
-            callback_data="ded_editpick:prorata",
-        )
-    builder.button(
-        text=f"✅ ₪{max_amount:,.2f} (מקסימום מותר)",
-        callback_data=f"ded_editpick:{max_amount}",
-    )
-    builder.button(text="↩️ ביטול", callback_data="ded_editcancel")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def _region_kb() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="תל אביב",          callback_data="region:tel_aviv")
-    builder.button(text="ירושלים",           callback_data="region:jerusalem")
-    builder.button(text="מרכז / חיפה",      callback_data="region:center")
-    builder.button(text="דרום",             callback_data="region:south")
-    builder.button(text="צפון",             callback_data="region:north")
-    builder.adjust(2, 2, 1)
-    return builder.as_markup()
-
+# ARCHITECTURE NOTE (Detailed Mode — Simple Mode bypass):
+# _DEDUCTION_META, _deduction_edit_kb(), _region_kb(), _ownership_kb(), and
+# _deductions_kb() are part of the per-item deduction UI infrastructure.
+# They are not used in Simple Mode (the bot asks only for agreed net salary and
+# cash advances). Re-enable / restore these for Detailed Mode.
 
 def _ownership_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -276,42 +245,6 @@ def _confirm_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def _deductions_kb(sel: dict[str, bool], amounts: dict[str, str]) -> InlineKeyboardMarkup:
-    """
-    Multi-select deductions keyboard with amounts shown inline.
-
-    Unselected row: single button "☐ <label>"
-    Selected row:   two buttons — "✅ <label> (₪X.XX)" + "✏️"
-    """
-    rows: list[list[InlineKeyboardButton]] = []
-
-    deduction_options = [
-        ("housing", "מגורים"),
-        ("health",  "ביטוח רפואי"),
-        ("extras",  "הוצאות נלוות"),
-        ("food",    "כלכלה"),
-    ]
-
-    for key, label in deduction_options:
-        if sel.get(key):
-            amount = Decimal(amounts.get(key, "0"))
-            rows.append([
-                InlineKeyboardButton(
-                    text=f"✅ {label} (₪{amount:,.2f})",
-                    callback_data=f"ded:{key}",
-                ),
-                InlineKeyboardButton(text="✏️", callback_data=f"ded_edit:{key}"),
-            ])
-        else:
-            rows.append([
-                InlineKeyboardButton(text=f"☐ {label}", callback_data=f"ded:{key}")
-            ])
-
-    rows.append([InlineKeyboardButton(text="🚫 אין ניכויים", callback_data="ded:none")])
-    rows.append([InlineKeyboardButton(text="סיום ✔️", callback_data="ded:done")])
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -344,30 +277,25 @@ def _parse_non_negative_int(text: str) -> int | None:
 
 # ── /start ─────────────────────────────────────────────────────────────────────
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
+async def _run_start_flow(message: Message, state: FSMContext, user_id: int) -> None:
+    """
+    Core /start logic.  Accepts an explicit user_id so it can be called from
+    both the /start command handler (where user_id = message.from_user.id) and
+    from callback handlers (where message is a bot-sent Message whose from_user
+    is the bot itself, not the real user — callback.from_user.id must be passed
+    instead).
+    """
     await state.clear()
 
-    user_id = message.from_user.id  # type: ignore[union-attr]
     saved_data: dict | None = None
     try:
         saved_data = await database.get_user(user_id)
     except Exception:
         log.warning("Firestore get_user failed for %s — continuing without saved data", user_id)
 
-    base_housing = saved_data.get("base_housing") if saved_data else None
-    base_health  = saved_data.get("base_health")  if saved_data else None
-    base_extras  = saved_data.get("base_extras")  if saved_data else None
-    has_contract = base_housing is not None
-
-    # Reconstruct the regional housing cap for use in handle_advances / deduction edit
-    contract_region    = saved_data.get("contract_region")    if saved_data else None
-    contract_ownership = saved_data.get("contract_ownership") if saved_data else None
-    if contract_region and contract_ownership:
-        caps = config.HOUSING_CAPS_OWNED if contract_ownership == "owned" else config.HOUSING_CAPS_RENTED
-        housing_cap = str(caps.get(contract_region, config.DEDUCTION_HOUSING_MAX))
-    else:
-        housing_cap = str(config.DEDUCTION_HOUSING_MAX)
+    # Simple Mode: the agreed monthly net salary is the setup gate
+    agreed_net_salary = saved_data.get("agreed_net_salary") if saved_data else None
+    has_contract = agreed_net_salary is not None
 
     # Load employment start date for month-picker filtering
     employment_start_iso: str | None = saved_data.get("employment_start_date") if saved_data else None
@@ -382,15 +310,18 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         saved_data=saved_data,
         user_id=user_id,
         entry_point="start",
-        base_housing=base_housing,
-        base_health=base_health,
-        base_extras=base_extras,
-        housing_cap=housing_cap,
+        agreed_net_salary=str(agreed_net_salary) if agreed_net_salary is not None else None,
         employment_start_date=employment_start_iso,
     )
 
     if not has_contract:
-        await _ask_contract_housing(message, state)
+        await state.clear()
+        await message.answer(
+            "👋 *ברוכים הבאים למחולל תלושי השכר!*\n\n"
+            "לפני הפקת תלוש ראשון, יש להגדיר את פרטי החוזה.\n\n"
+            "הקלד /setup להתחלת ההגדרה.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     await message.answer(
@@ -405,6 +336,11 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         reply_markup=_month_picker_kb(employment_start),
     )
     await state.set_state(PayslipForm.month_year)
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await _run_start_flow(message, state, user_id=message.from_user.id)  # type: ignore[union-attr]
 
 
 # ── /forget_me command ────────────────────────────────────────────────────────
@@ -427,28 +363,8 @@ async def cmd_forget_me(message: Message) -> None:
 
 def _setup_summary(saved: dict) -> str:
     """Build the human-readable settings card shown by /setup."""
-    region_key      = saved.get("contract_region", "")
-    ownership       = saved.get("contract_ownership", "")
-    region_label    = _REGION_LABELS.get(region_key, "לא הוגדר")
-    ownership_label = (
-        "בבעלות המעסיק" if ownership == "owned" else
-        "שכורה"          if ownership == "rented" else "לא הוגדר"
-    )
-    caps = config.HOUSING_CAPS_OWNED if ownership == "owned" else config.HOUSING_CAPS_RENTED
-    cap  = caps.get(region_key)
-    cap_str = f" _(תקרה: ₪{cap:,.2f})_" if cap else ""
-
-    b_housing = saved.get("base_housing")
-    b_health  = saved.get("base_health")
-    b_extras  = saved.get("base_extras")
-    if b_housing is not None:
-        deductions_lines = (
-            f"   🏠 דיור: ₪{b_housing:.2f}\n"
-            f"   🏥 ביטוח רפואי: ₪{b_health:.2f}\n"
-            f"   📦 ציוד: ₪{b_extras:.2f}"
-        )
-    else:
-        deductions_lines = "   לא הוגדרו"
+    agreed_net = saved.get("agreed_net_salary")
+    net_display = f"₪{agreed_net:,.2f}" if agreed_net is not None else "לא הוגדר"
 
     start_iso = saved.get("employment_start_date")
     if start_iso:
@@ -465,15 +381,16 @@ def _setup_summary(saved: dict) -> str:
     employer_display  = employer  if employer  != _SKIPPED else "לא הוגדר"
     caregiver_display = caregiver if caregiver != _SKIPPED else "לא הוגדר"
 
+    rest_day = saved.get("rest_day", config.DEFAULT_REST_DAY)
+    rest_day_display = config.rest_day_hebrew(rest_day)
+
     return (
         "⚙️ *הגדרות*\n\n"
         f"👤 מעסיק: {employer_display}\n"
         f"👤 מטפל/ת: {caregiver_display}\n"
-        f"📍 אזור: {region_label}\n"
-        f"🏠 דירה: {ownership_label}{cap_str}\n"
-        "💰 ניכויים לחודש מלא:\n"
-        f"{deductions_lines}\n"
-        f"📅 תחילת העסקה: {start_display}"
+        f"💰 שכר נטו חודשי מוסכם: {net_display}\n"
+        f"📅 תחילת העסקה: {start_display}\n"
+        f"🗓️ יום מנוחה שבועי: {rest_day_display}"
     )
 
 
@@ -492,12 +409,9 @@ async def cmd_setup(message: Message, state: FSMContext) -> None:
         user_id=user_id,
         entry_point="setup_cmd",
         saved_data=saved_data,
-        base_housing=None,
-        base_health=None,
-        base_extras=None,
     )
 
-    if saved_data and saved_data.get("base_housing") is not None:
+    if saved_data and saved_data.get("agreed_net_salary") is not None:
         await message.answer(
             _setup_summary(saved_data),
             parse_mode=ParseMode.MARKDOWN,
@@ -506,14 +420,14 @@ async def cmd_setup(message: Message, state: FSMContext) -> None:
         await state.set_state(ContractSetupForm.review)
         return
 
-    await _ask_contract_housing(message, state)
+    await _ask_agreed_net_salary(message, state)
 
 
 @router.callback_query(ContractSetupForm.review, F.data == "setup:edit")
 async def handle_setup_edit(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
-    await _ask_contract_housing(callback.message, state)  # type: ignore[arg-type]
+    await _ask_agreed_net_salary(callback.message, state)  # type: ignore[arg-type]
 
 
 @router.callback_query(ContractSetupForm.review, F.data == "setup:ok")
@@ -523,26 +437,104 @@ async def handle_setup_ok(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
 
 
-async def _ask_contract_housing(message: Message, state: FSMContext) -> None:
-    """Entry point for ContractSetupForm — first ask the region."""
-    data = await state.get_data()
-    saved: dict = data.get("saved_data") or {}
-    current_region = saved.get("contract_region", "")
-    current_hint = (
-        f"_(אזור נוכחי: {_REGION_LABELS[current_region]})_\n\n"
-        if current_region in _REGION_LABELS else ""
-    )
-    await state.set_state(ContractSetupForm.region)
-    await message.answer(
-        "📋 *הגדרה קצרה לפני שמתחילים*\n\n"
-        "כדי שהבוט יוכל לחשב עבורך אוטומטית את סכומי הניכויים בחודשים חלקיים, "
-        "אני צריך לדעת באיזה אזור המטפל/ת גר/ה ועובד/ת.\n\n"
-        "אפשר לשנות את הערכים האלה בכל עת עם /setup.\n\n"
-        f"📍 *באיזה אזור מתבצעת העבודה?*\n{current_hint}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_region_kb(),
+@router.callback_query(F.data == "setup_done:start")
+async def handle_setup_done_start(callback: CallbackQuery, state: FSMContext) -> None:
+    """'הפק תלוש עכשיו' button shown after /setup completes — jumps straight into /start.
+
+    Must pass callback.from_user.id explicitly.  callback.message is the message
+    the bot sent, so callback.message.from_user is the BOT — using it would cause
+    a Firestore lookup on the bot's user_id and falsely show "no contract".
+    """
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    await _run_start_flow(
+        callback.message,  # type: ignore[arg-type]
+        state,
+        user_id=callback.from_user.id,
     )
 
+
+async def _ask_agreed_net_salary(message: Message, state: FSMContext) -> None:
+    """Entry point for ContractSetupForm — ask for the agreed monthly net salary."""
+    data = await state.get_data()
+    saved: dict = data.get("saved_data") or {}
+    current = saved.get("agreed_net_salary")
+    current_hint = f" _(נוכחי: ₪{current:,.2f})_" if current is not None else ""
+    keep_kb = _keep_btn(f"₪{current:,.2f}", "agreed_net_salary") if current is not None else None
+    await state.set_state(ContractSetupForm.agreed_net_salary)
+    await message.answer(
+        f"📋 *הגדרה קצרה לפני שמתחילים*\n\n"
+        "מה *השכר הנטו החודשי המוסכם* — הסכום שהמטפל/ת מקבל/ת ביד לחודש מלא?\n"
+        f"_(הזן את הסכום בשקלים, לדוגמה: 5989){current_hint}_\n\n"
+        "אפשר לעדכן בכל עת עם /setup.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keep_kb,
+    )
+
+
+@router.message(ContractSetupForm.agreed_net_salary)
+async def handle_agreed_net_salary(message: Message, state: FSMContext) -> None:
+    val = _parse_decimal(message.text or "")
+    if val is None or val <= 0:
+        await message.answer("נא להזין סכום חיובי (לדוגמה: 5989).")
+        return
+    await state.update_data(contract_agreed_net=str(val))
+    await _ask_setup_rest_day(message, state)
+
+
+@router.callback_query(ContractSetupForm.agreed_net_salary, F.data == "setup_keep:agreed_net_salary")
+async def keep_agreed_net_salary(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    data = await state.get_data()
+    saved: dict = data.get("saved_data") or {}
+    val = Decimal(str(saved.get("agreed_net_salary", "0")))
+    await state.update_data(contract_agreed_net=str(val))
+    await _ask_setup_rest_day(callback.message, state)  # type: ignore[arg-type]
+
+
+# ── Setup: rest_day ────────────────────────────────────────────────────────────
+
+def _rest_day_kb(current: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for key, (label, _) in config.REST_DAY_OPTIONS.items():
+        mark = " ✅" if key == current else ""
+        builder.button(text=f"{label}{mark}", callback_data=f"setup_rest:{key}")
+    builder.adjust(3)
+    return builder.as_markup()
+
+
+async def _ask_setup_rest_day(message: Message, state: FSMContext) -> None:
+    await state.set_state(ContractSetupForm.rest_day)
+    data = await state.get_data()
+    saved: dict = data.get("saved_data") or {}
+    current = saved.get("rest_day", config.DEFAULT_REST_DAY)
+    await message.answer(
+        "🗓️ *מהו יום המנוחה השבועי של המטפל/ת?*\n"
+        "_(יום זה לא נספר בחישוב ימי העבודה ומשולם בתוספת בנפרד)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_rest_day_kb(current),
+    )
+
+
+@router.callback_query(ContractSetupForm.rest_day, F.data.startswith("setup_rest:"))
+async def handle_setup_rest_day(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    key = callback.data.split(":")[1]  # type: ignore[union-attr]
+    label = config.rest_day_hebrew(key)
+    await state.update_data(contract_rest_day=key)
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        f"🗓️ יום מנוחה: *{label}*", parse_mode=ParseMode.MARKDOWN
+    )
+    await _ask_setup_start_date(callback.message, state)  # type: ignore[arg-type]
+
+
+# ARCHITECTURE NOTE (Detailed Mode — currently bypassed in Simple Mode):
+# The following region/ownership/housing/health/extras handlers were removed
+# as part of the Simple Mode simplification. The FSM states (ContractSetupForm.region,
+# .ownership_type, .housing, .health, .extras) and associated keyboards (_region_kb,
+# _ownership_kb, _deductions_kb) are also preserved as comments above.
+# Re-enable all of the above when implementing Detailed Mode.
 
 _REGION_LABELS: dict[str, str] = {
     "tel_aviv":  "תל אביב",
@@ -551,137 +543,6 @@ _REGION_LABELS: dict[str, str] = {
     "south":     "דרום",
     "north":     "צפון",
 }
-
-
-@router.callback_query(ContractSetupForm.region, F.data.startswith("region:"))
-async def handle_contract_region(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    region = callback.data.split(":")[1]
-    await state.update_data(contract_region=region)
-    label = _REGION_LABELS.get(region, region)
-    await callback.message.edit_text(f"📍 אזור: *{label}*", parse_mode=ParseMode.MARKDOWN)  # type: ignore[union-attr]
-
-    data = await state.get_data()
-    saved: dict = data.get("saved_data") or {}
-    current_ownership = saved.get("contract_ownership", "")
-    ownership_hint = ""
-    if current_ownership in ("owned", "rented"):
-        current_ownership_label = "בבעלות המעסיק" if current_ownership == "owned" else "שכורה"
-        ownership_hint = f"\n_(סוג נוכחי: {current_ownership_label})_"
-
-    await callback.message.answer(  # type: ignore[union-attr]
-        f"🏠 *הדירה שבה המטפל/ת גר/ה* — שייכת למי?{ownership_hint}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_ownership_kb(),
-    )
-    await state.set_state(ContractSetupForm.ownership_type)
-
-
-@router.callback_query(ContractSetupForm.ownership_type, F.data.startswith("ownership:"))
-async def handle_contract_ownership(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    ownership = callback.data.split(":")[1]   # "owned" or "rented"
-    data = await state.get_data()
-    region: str = data["contract_region"]
-
-    caps = config.HOUSING_CAPS_OWNED if ownership == "owned" else config.HOUSING_CAPS_RENTED
-    housing_cap: Decimal = caps[region]
-
-    await state.update_data(contract_ownership=ownership, housing_cap=str(housing_cap))
-
-    ownership_label = "בבעלות המעסיק" if ownership == "owned" else "שכורה"
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        f"🏠 דירה: *{ownership_label}*", parse_mode=ParseMode.MARKDOWN
-    )
-    saved: dict = data.get("saved_data") or {}
-    current_housing = saved.get("base_housing")
-    housing_current_hint = (
-        f" _(נוכחי: ₪{current_housing:.2f})_" if current_housing is not None else ""
-    )
-    keep_kb = _keep_btn(f"₪{current_housing:.2f}", "housing") if current_housing is not None else None
-    await callback.message.answer(  # type: ignore[union-attr]
-        f"🏠 *דיור* — כמה ₪ מנוכה לחודש מלא?{housing_current_hint}\n"
-        f"_(תקרה חוקית לאזור זה: ₪{housing_cap:,.2f}. הזן 0 אם לא מנוכה דיור)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keep_kb,
-    )
-    await state.set_state(ContractSetupForm.housing)
-
-
-@router.message(ContractSetupForm.housing)
-async def handle_contract_housing(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    housing_cap = Decimal(data.get("housing_cap") or str(config.DEDUCTION_HOUSING_MAX))
-    val = _parse_decimal(message.text or "")
-    if val is None or val < 0:
-        await message.answer("נא להזין סכום חיובי.")
-        return
-    if val > housing_cap:
-        await message.answer(
-            f"שים לב: הסכום שהזנת גבוה מהתקרה החוקית לאזור זה (₪{housing_cap:,.2f} לחודש מלא).\n"
-            "אנא הזן את הסכום שמופיע בחוזה:"
-        )
-        return
-    await state.update_data(contract_housing=str(val))
-    await state.set_state(ContractSetupForm.health)
-    saved: dict = data.get("saved_data") or {}
-    current_health = saved.get("base_health")
-    health_current_hint = (
-        f" _(נוכחי: ₪{current_health:.2f})_" if current_health is not None else ""
-    )
-    keep_kb = _keep_btn(f"₪{current_health:.2f}", "health") if current_health is not None else None
-    await message.answer(
-        f"🏥 *ביטוח רפואי* — כמה ₪ מנוכה לחודש מלא?{health_current_hint}\n"
-        f"_(מקסימום חוקי: ₪{config.DEDUCTION_HEALTH_MAX:,.2f}. הזן 0 אם לא מנוכה ביטוח רפואי)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keep_kb,
-    )
-
-
-@router.message(ContractSetupForm.health)
-async def handle_contract_health(message: Message, state: FSMContext) -> None:
-    val = _parse_decimal(message.text or "")
-    if val is None or val < 0:
-        await message.answer("נא להזין סכום חיובי.")
-        return
-    if val > config.DEDUCTION_HEALTH_MAX:
-        await message.answer(
-            f"שים לב: הסכום שהזנת גבוה מהמותר בחוק לניכוי ביטוח רפואי (₪{config.DEDUCTION_HEALTH_MAX:,.2f} לחודש מלא).\n"
-            "אנא הזן את הסכום שמופיע בחוזה:"
-        )
-        return
-    await state.update_data(contract_health=str(val))
-    await state.set_state(ContractSetupForm.extras)
-    data = await state.get_data()
-    saved_now: dict = data.get("saved_data") or {}
-    current_extras = saved_now.get("base_extras")
-    extras_current_hint = (
-        f" _(נוכחי: ₪{current_extras:.2f})_" if current_extras is not None else ""
-    )
-    keep_kb = _keep_btn(f"₪{current_extras:.2f}", "extras") if current_extras is not None else None
-    await message.answer(
-        f"📦 *ציוד והוצאות נוספות* — כמה ₪ מנוכה לחודש מלא?{extras_current_hint}\n"
-        f"_(מקסימום חוקי: ₪{config.DEDUCTION_EXTRAS_MAX:,.2f}. הזן 0 אם לא מנוכה)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keep_kb,
-    )
-
-
-@router.message(ContractSetupForm.extras)
-async def handle_contract_extras(message: Message, state: FSMContext) -> None:
-    val = _parse_decimal(message.text or "")
-    if val is None or val < 0:
-        await message.answer("נא להזין סכום חיובי.")
-        return
-    if val > config.DEDUCTION_EXTRAS_MAX:
-        await message.answer(
-            f"שים לב: הסכום שהזנת גבוה מהמותר בחוק לניכוי זה (₪{config.DEDUCTION_EXTRAS_MAX:,.2f} לחודש מלא).\n"
-            "אנא הזן את הסכום שמופיע בחוזה:"
-        )
-        return
-
-    await state.update_data(contract_extras=str(val))
-    await _ask_setup_start_date(message, state)
 
 
 async def _ask_setup_start_date(message: Message, state: FSMContext) -> None:
@@ -886,21 +747,21 @@ async def _complete_setup(message: Message, state: FSMContext, emp_start: date) 
     """Persist all collected setup data and finish the wizard."""
     employment_start_iso = emp_start.isoformat()
     data = await state.get_data()
-    base_housing = Decimal(data["contract_housing"])
-    base_health  = Decimal(data["contract_health"])
-    base_extras  = Decimal(data["contract_extras"])
+    agreed_net_salary = Decimal(data["contract_agreed_net"])
     user_id: int = data["user_id"]
     entry_point: str = data.get("entry_point", "start")
 
     employer_name  = data.get("setup_employer_name",  _SKIPPED) or _SKIPPED
     caregiver_name = data.get("setup_caregiver_name", _SKIPPED) or _SKIPPED
 
+    rest_day: str = data.get("contract_rest_day") or config.DEFAULT_REST_DAY
+
     try:
         await database.upsert_contract(
-            user_id, base_housing, base_health, base_extras,
-            region=data.get("contract_region"),
-            ownership=data.get("contract_ownership"),
+            user_id,
+            agreed_net_salary=agreed_net_salary,
             employment_start_date=employment_start_iso,
+            rest_day=rest_day,
         )
     except Exception as exc:
         log.warning("upsert_contract failed: %s", exc)
@@ -912,29 +773,27 @@ async def _complete_setup(message: Message, state: FSMContext, emp_start: date) 
             log.warning("upsert_user (setup) failed: %s", exc)
 
     await state.update_data(
-        base_housing=float(base_housing),
-        base_health=float(base_health),
-        base_extras=float(base_extras),
+        agreed_net_salary=str(agreed_net_salary),
         employment_start_date=employment_start_iso,
+        rest_day=rest_day,
     )
 
     if entry_point == "setup_cmd":
         # Build summary from the values we just saved (before clearing state)
         summary_data: dict = {
-            "contract_region":      data.get("contract_region"),
-            "contract_ownership":   data.get("contract_ownership"),
-            "base_housing":         float(base_housing),
-            "base_health":          float(base_health),
-            "base_extras":          float(base_extras),
+            "agreed_net_salary":     float(agreed_net_salary),
             "employment_start_date": employment_start_iso,
-            "employer_name":        employer_name,
-            "caregiver_name":       caregiver_name,
+            "employer_name":         employer_name,
+            "caregiver_name":        caregiver_name,
+            "rest_day":              rest_day,
         }
         await state.clear()
         await message.answer(
-            "✅ *ההגדרות עודכנו!*\n\n" + _setup_summary(summary_data) + "\n\n"
-            "בפעם הבאה שתפיק תלוש (/start), הבוט ישתמש בהגדרות החדשות.",
+            "✅ *ההגדרות עודכנו!*\n\n" + _setup_summary(summary_data),
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📄 הפק תלוש עכשיו", callback_data="setup_done:start"),
+            ]]),
         )
         return
 
@@ -954,56 +813,6 @@ async def _complete_setup(message: Message, state: FSMContext, emp_start: date) 
 
 
 # ── ContractSetupForm — "keep current value" quick-tap callbacks ──────────────
-
-@router.callback_query(ContractSetupForm.housing, F.data == "setup_keep:housing")
-async def keep_housing(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
-    data = await state.get_data()
-    saved: dict = data.get("saved_data") or {}
-    val = Decimal(str(saved.get("base_housing", "0")))
-    await state.update_data(contract_housing=str(val))
-    await state.set_state(ContractSetupForm.health)
-    current_health = saved.get("base_health")
-    keep_kb = _keep_btn(f"₪{current_health:.2f}", "health") if current_health is not None else None
-    await callback.message.answer(  # type: ignore[union-attr]
-        f"🏥 *ביטוח רפואי* — כמה ₪ מנוכה לחודש מלא?"
-        + (f" _(נוכחי: ₪{current_health:.2f})_" if current_health is not None else "") + "\n"
-        f"_(מקסימום חוקי: ₪{config.DEDUCTION_HEALTH_MAX:,.2f}. הזן 0 אם לא מנוכה ביטוח רפואי)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keep_kb,
-    )
-
-
-@router.callback_query(ContractSetupForm.health, F.data == "setup_keep:health")
-async def keep_health(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
-    data = await state.get_data()
-    saved: dict = data.get("saved_data") or {}
-    val = Decimal(str(saved.get("base_health", "0")))
-    await state.update_data(contract_health=str(val))
-    await state.set_state(ContractSetupForm.extras)
-    current_extras = saved.get("base_extras")
-    keep_kb = _keep_btn(f"₪{current_extras:.2f}", "extras") if current_extras is not None else None
-    await callback.message.answer(  # type: ignore[union-attr]
-        f"📦 *ציוד והוצאות נוספות* — כמה ₪ מנוכה לחודש מלא?"
-        + (f" _(נוכחי: ₪{current_extras:.2f})_" if current_extras is not None else "") + "\n"
-        f"_(מקסימום חוקי: ₪{config.DEDUCTION_EXTRAS_MAX:,.2f}. הזן 0 אם לא מנוכה)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=keep_kb,
-    )
-
-
-@router.callback_query(ContractSetupForm.extras, F.data == "setup_keep:extras")
-async def keep_extras(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
-    data = await state.get_data()
-    saved: dict = data.get("saved_data") or {}
-    val = Decimal(str(saved.get("base_extras", "0")))
-    await state.update_data(contract_extras=str(val))
-    await _ask_setup_start_date(callback.message, state)  # type: ignore[arg-type]
 
 
 @router.callback_query(ContractSetupForm.start_date, F.data == "setup_keep:start_date")
@@ -1210,15 +1019,22 @@ async def _confirm_month_and_proceed(
 
     # Auto-detect first partial month from employment start date
     data = await state.get_data()
+    saved: dict = data.get("saved_data") or {}
+    _rest_day_key = saved.get("rest_day") or data.get("rest_day") or config.DEFAULT_REST_DAY
+    _rest_weekday = config.rest_day_weekday(_rest_day_key)
+
     start_iso = data.get("employment_start_date")
     if start_iso:
         try:
             emp_start = date.fromisoformat(start_iso)
             if emp_start.year == year and emp_start.month == month and emp_start.day > 1:
-                active_days, days_worked = calculate_partial_days("started", emp_start.day, month, year)
+                active_days, days_worked = calculate_partial_days(
+                    "started", emp_start.day, month, year, _rest_weekday
+                )
                 await state.update_data(
                     partial_type="started",
                     days_worked=days_worked,
+                    active_days=active_days,
                 )
                 days_in_month = calendar.monthrange(year, month)[1]
                 auto_text = (
@@ -1233,7 +1049,7 @@ async def _confirm_month_and_proceed(
                         pass
                 else:
                     await message.answer(auto_text, parse_mode=ParseMode.MARKDOWN)
-                await _ask_employer_name(message, state)
+                await _ask_details(message, state)
                 return
         except ValueError:
             pass
@@ -1261,7 +1077,7 @@ async def handle_work_period(callback: CallbackQuery, state: FSMContext) -> None
     if period == "full":
         await state.update_data(days_worked=26)
         await callback.message.edit_text("✅ חודש מלא — 26 ימי עבודה.")  # type: ignore[union-attr]
-        await _ask_employer_name(callback.message, state)  # type: ignore[arg-type]
+        await _ask_details(callback.message, state)  # type: ignore[arg-type]
     else:
         await callback.message.edit_text("⚠️ חודש חלקי.")  # type: ignore[union-attr]
         await callback.message.answer(  # type: ignore[union-attr]
@@ -1317,16 +1133,78 @@ async def handle_partial_day(message: Message, state: FSMContext) -> None:
         return
 
     ptype: str = data["partial_type"]
-    active_days, days_worked = calculate_partial_days(ptype, val, month, year)
+    saved_d: dict = data.get("saved_data") or {}
+    _rdk = saved_d.get("rest_day") or data.get("rest_day") or config.DEFAULT_REST_DAY
+    active_days, days_worked = calculate_partial_days(ptype, val, month, year, config.rest_day_weekday(_rdk))
 
-    await state.update_data(days_worked=days_worked)
+    await state.update_data(days_worked=days_worked, active_days=active_days)
     month_name = config.HEBREW_MONTHS[month]
     await message.answer(
         f"✅ *{active_days} ימים פעילים* מתוך {days_in_month} ימי חודש {month_name} "
         f"= *{days_worked} ימי עבודה* מחושבים מתוך 26.",
         parse_mode=ParseMode.MARKDOWN,
     )
-    await _ask_employer_name(message, state)
+    await _ask_details(message, state)
+
+
+# ── Fast-track: confirm saved details in one step ──────────────────────────────
+
+async def _ask_details(message: Message, state: FSMContext) -> None:
+    """
+    If both employer_name and caregiver_name are saved, show a single confirmation
+    prompt so the user can skip all three sequential questions in one tap.
+    Falls back to the sequential flow if either name is missing.
+    """
+    data = await state.get_data()
+    saved: dict = data.get("saved_data") or {}
+    employer = saved.get("employer_name", _SKIPPED)
+    caregiver = saved.get("caregiver_name", _SKIPPED)
+
+    if employer and employer != _SKIPPED and caregiver and caregiver != _SKIPPED:
+        await state.set_state(PayslipForm.details_confirm)
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✅ כן, המשך", callback_data="details:use_saved")
+        builder.button(text="✏️ עריכת פרטים", callback_data="details:edit")
+        builder.adjust(1)
+        await message.answer(
+            f"📋 *פרטים שמורים במערכת:*\n"
+            f"מעסיק: {employer}\n"
+            f"מטפל/ת: {caregiver}\n\n"
+            "האם להשתמש בפרטים אלו לתלוש הנוכחי?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=builder.as_markup(),
+        )
+    else:
+        await _ask_employer_name(message, state)
+
+
+@router.callback_query(PayslipForm.details_confirm, F.data == "details:use_saved")
+async def handle_details_use_saved(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    saved: dict = data.get("saved_data") or {}
+    employer = saved.get("employer_name", _SKIPPED)
+    caregiver = saved.get("caregiver_name", _SKIPPED)
+    await state.update_data(
+        employer_name=employer,
+        caregiver_name=caregiver,
+        passport=_SKIPPED,  # passport is never stored (zero-data retention)
+    )
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        f"📋 מעסיק: *{employer}* | מטפל/ת: *{caregiver}*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    await _ask_shabbat_days(callback.message, state)  # type: ignore[arg-type]
+
+
+@router.callback_query(PayslipForm.details_confirm, F.data == "details:edit")
+async def handle_details_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    except TelegramBadRequest:
+        pass
+    await _ask_employer_name(callback.message, state)  # type: ignore[arg-type]
 
 
 # ── State: employer_name ───────────────────────────────────────────────────────
@@ -1335,15 +1213,6 @@ async def _ask_employer_name(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     saved: dict = data.get("saved_data") or {}
     await state.set_state(PayslipForm.employer_name)
-
-    # Show accumulated balance as its own message if non-zero
-    vac  = saved.get("vacation_balance", 0.0) or 0.0
-    sick = saved.get("sick_balance",     0.0) or 0.0
-    if vac or sick:
-        await message.answer(
-            f"💾 *יתרה צבורה:* {vac:.2f} ימי חופשה | {sick:.2f} ימי מחלה",
-            parse_mode=ParseMode.MARKDOWN,
-        )
 
     saved_employer = saved.get("employer_name", _SKIPPED)
     builder = InlineKeyboardBuilder()
@@ -1458,7 +1327,7 @@ async def skip_passport(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.update_data(passport=_SKIPPED)
     await callback.message.edit_text("⏭️ מספר דרכון — לא הוזן.")  # type: ignore[union-attr]
-    await _ask_shabbat(callback.message, state)  # type: ignore[arg-type]
+    await _ask_shabbat_days(callback.message, state)  # type: ignore[arg-type]
 
 
 @router.message(PayslipForm.passport)
@@ -1468,324 +1337,140 @@ async def handle_passport(message: Message, state: FSMContext) -> None:
         await _invalid(message, "נא להזין מספר דרכון תקין.")
         return
     await state.update_data(passport=passport)
-    await _ask_shabbat(message, state)
-
-
-async def _ask_shabbat(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    _, shabbat_rate = config.get_wage_params(data["month"], data["year"])
-    await message.answer(
-        f"כמה שבתות (ימי מנוחה שבועיים) עבד/ה העובד/ת החודש?\n"
-        f"_(כל שבת = {shabbat_rate} ₪ — הזן 0 אם לא עבד/ה בשבתות)_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await state.set_state(PayslipForm.shabbat_days)
+    await _ask_shabbat_days(message, state)
 
 
 # ── State: shabbat_days ────────────────────────────────────────────────────────
 
+def _zero_kb(callback_data: str, label: str = "✅ לא עבד/ה (0)") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text=label, callback_data=callback_data)
+    return builder.as_markup()
+
+
+async def _ask_shabbat_days(message: Message, state: FSMContext) -> None:
+    await state.set_state(PayslipForm.shabbat_days)
+    data = await state.get_data()
+    saved_s: dict = data.get("saved_data") or {}
+    _rdk = saved_s.get("rest_day") or data.get("rest_day") or config.DEFAULT_REST_DAY
+    rest_label = config.rest_day_hebrew(_rdk)
+    await message.answer(
+        f"כמה ימי *{rest_label}* עבד/ה המטפל/ת החודש?\n_(שכר יום מנוחה מתווסף לשכר היסוד)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_zero_kb("shabbat:zero"),
+    )
+
+
+@router.callback_query(PayslipForm.shabbat_days, F.data == "shabbat:zero")
+async def handle_shabbat_zero(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    except TelegramBadRequest:
+        pass
+    await state.update_data(shabbat_days="0")
+    await _ask_holiday_days(callback.message, state)  # type: ignore[arg-type]
+
+
 @router.message(PayslipForm.shabbat_days)
 async def handle_shabbat_days(message: Message, state: FSMContext) -> None:
-    val = _parse_non_negative_int(message.text or "")
-    if val is None or val > 6:
-        await _invalid(message, "נא להזין מספר שבתות בין 0 ל-6.")
+    val = (message.text or "").strip()
+    if not val.isdigit() or int(val) < 0:
+        await _invalid(message, "נא להזין מספר שלם חיובי (לדוגמה: 0, 1, 2).")
         return
     await state.update_data(shabbat_days=val)
-
-    data = await state.get_data()
-    _, shabbat_rate = config.get_wage_params(data["month"], data["year"])
-    await message.answer(
-        f"כמה ימי חג עבד/ה העובד/ת החודש?\n"
-        f"_(כל חג = {shabbat_rate} ₪ — הזן 0 אם לא עבד/ה בחגים)_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await state.set_state(PayslipForm.holiday_days)
+    await _ask_holiday_days(message, state)
 
 
 # ── State: holiday_days ────────────────────────────────────────────────────────
 
+async def _ask_holiday_days(message: Message, state: FSMContext) -> None:
+    await state.set_state(PayslipForm.holiday_days)
+    await message.answer(
+        "כמה *ימי חג* עבד/ה המטפל/ת החודש?\n_(שכר חג מתווסף לשכר היסוד)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_zero_kb("holiday:zero"),
+    )
+
+
+@router.callback_query(PayslipForm.holiday_days, F.data == "holiday:zero")
+async def handle_holiday_zero(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    except TelegramBadRequest:
+        pass
+    await state.update_data(holiday_days="0")
+    await _ask_advances(callback.message, state)  # type: ignore[arg-type]
+
+
 @router.message(PayslipForm.holiday_days)
 async def handle_holiday_days(message: Message, state: FSMContext) -> None:
-    val = _parse_non_negative_int(message.text or "")
-    if val is None or val > 10:
-        await _invalid(message, "נא להזין מספר ימי חג בין 0 ל-10.")
+    val = (message.text or "").strip()
+    if not val.isdigit() or int(val) < 0:
+        await _invalid(message, "נא להזין מספר שלם חיובי (לדוגמה: 0, 1, 2).")
         return
     await state.update_data(holiday_days=val)
-    await message.answer(
-        "כמה שבועות שולמו דמי כיס (100 ₪ לשבוע) לעובד/ת?\n"
-        "_(בדרך כלל 4. הזן 0 אם דמי כיס לא שולמו)_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await state.set_state(PayslipForm.pocket_money_weeks)
+    await _ask_advances(message, state)
 
 
-# ── State: pocket_money_weeks ──────────────────────────────────────────────────
+# ARCHITECTURE NOTE (Simple Mode — Detailed Mode bypass):
+# pocket_money_weeks question is skipped.
+# Re-enable when implementing Detailed Mode.
 
-@router.message(PayslipForm.pocket_money_weeks)
-async def handle_pocket_money(message: Message, state: FSMContext) -> None:
-    val = _parse_non_negative_int(message.text or "")
-    if val is None or val > 6:
-        await _invalid(message, "נא להזין מספר שבועות בין 0 ל-6.")
-        return
-    await state.update_data(pocket_money_weeks=val)
-    await message.answer(
-        "האם שולמו *מקדמות נוספות* לשכר (מעבר לדמי הכיס) החודש?\n"
-        "_(הזן את הסכום בשקלים, או 0 אם לא)_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+
+async def _ask_advances(message: Message, state: FSMContext) -> None:
     await state.set_state(PayslipForm.advances)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ לא שולמו מקדמות (0)", callback_data="advances:zero")
+    await message.answer(
+        "האם שולמו *מקדמות או דמי כיס במזומן* במהלך החודש?\n"
+        "_(הזן סכום בשקלים, או לחץ על הכפתור אם לא שולם כלום)_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=builder.as_markup(),
+    )
 
 
 # ── State: advances ────────────────────────────────────────────────────────────
+
+@router.callback_query(PayslipForm.advances, F.data == "advances:zero")
+async def handle_advances_zero(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    except TelegramBadRequest:
+        pass
+    await state.update_data(advances="0")
+    await _show_confirm(callback.message, state)  # type: ignore[arg-type]
+
 
 @router.message(PayslipForm.advances)
 async def handle_advances(message: Message, state: FSMContext) -> None:
     val = _parse_decimal(message.text or "")
     if val is None or val < 0:
-        await _invalid(message, "נא להזין סכום חיובי (לדוגמה: 200 או 0).")
+        await _invalid(message, "נא להזין סכום חיובי (לדוגמה: 200).")
         return
     await state.update_data(advances=str(val))
-
-    # Pre-calculate pro-rata maxima for fixed deductions.
-    # Housing uses the region-specific cap when available, else falls back to config default.
-    data = await state.get_data()
-    days_worked: int = data.get("days_worked", 26)
-    ratio = Decimal(days_worked) / Decimal("26")
-    housing_cap = Decimal(data.get("housing_cap") or str(config.DEDUCTION_HOUSING_MAX))
-    cfg_maxima: dict[str, Decimal] = {
-        "housing": housing_cap,
-        "health":  config.DEDUCTION_HEALTH_MAX,
-        "extras":  config.DEDUCTION_EXTRAS_MAX,
-    }
-    pro_rata_max = {
-        k: str((cap * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        for k, cap in cfg_maxima.items()
-    }
-
-    # Use contract base values (from /setup) when available — pro-rate them.
-    # Fall back to the legal pro-rata max when no contract value is stored.
-    def _amount(base_key: str, cap: Decimal) -> str:
-        base = data.get(base_key)
-        if base is not None and float(base) > 0:
-            return str(
-                (Decimal(str(base)) * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            )
-        return str((cap * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
-    deductions_amounts = {
-        "housing": _amount("base_housing", housing_cap),
-        "health":  _amount("base_health",  config.DEDUCTION_HEALTH_MAX),
-        "extras":  _amount("base_extras",  config.DEDUCTION_EXTRAS_MAX),
-        "food": "0",
-    }
-
-    # Pre-select any deduction whose contract base is set and non-zero.
-    def _selected(base_key: str) -> bool:
-        v = data.get(base_key)
-        return v is not None and float(v) > 0
-
-    sel = {
-        "housing": _selected("base_housing"),
-        "health":  _selected("base_health"),
-        "extras":  _selected("base_extras"),
-        "food": False,
-    }
-    await state.update_data(
-        deductions_selected=sel,
-        deductions_amounts=deductions_amounts,
-        deductions_pro_rata_max=pro_rata_max,
-    )
-
-    await message.answer(
-        "אילו *ניכויים מותרים* מנוכים מהשכר החודש?\n"
-        "_(לחץ לסימון/ביטול. לחץ ✏️ לשינוי הסכום. לחץ סיום בסיום הבחירה)_\n\n"
-        "⚠️ ניכויים מותרים דורשים הסכמת העובד בכתב (נספח ג׳ לחוזה).",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_deductions_kb(sel, deductions_amounts),
-    )
-    await state.set_state(PayslipForm.deductions)
+    # ARCHITECTURE NOTE (Simple Mode): deductions multi-select is bypassed.
+    # Advances are the only deduction collected. Re-enable deductions screen
+    # for Detailed Mode.
+    await _show_confirm(message, state)
 
 
-# ── State: deductions (inline multi-select with inline amounts) ────────────────
-
-@router.callback_query(PayslipForm.deductions, F.data.startswith("ded:"))
-async def handle_deductions(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    key = callback.data.split(":")[1]
-
-    data = await state.get_data()
-    sel: dict[str, bool] = data.get("deductions_selected", {
-        "housing": False, "health": False, "extras": False, "food": False
-    })
-    amounts: dict[str, str] = data.get("deductions_amounts", {})
-
-    if key == "none":
-        sel = {"housing": False, "health": False, "extras": False, "food": False}
-        await state.update_data(deductions_selected=sel)
-        await callback.message.edit_reply_markup(reply_markup=_deductions_kb(sel, amounts))  # type: ignore[union-attr]
-        return
-
-    if key == "done":
-        await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
-        await _show_confirm(callback.message, state)  # type: ignore[arg-type]
-        return
-
-    # Toggle the selected key — default amount pre-filled in deductions_amounts
-    if key in sel:
-        sel[key] = not sel[key]
-        await state.update_data(deductions_selected=sel)
-        await callback.message.edit_reply_markup(reply_markup=_deductions_kb(sel, amounts))  # type: ignore[union-attr]
-
-
-# ── State: deductions — inline amount editing via ✏️ button ───────────────────
-
-def _max_for_key(key: str, data: dict) -> Decimal:
-    """Return the legal maximum amount for a deduction key given current FSM data."""
-    if key == "food":
-        return config.DEDUCTION_FOOD_MAX
-    return Decimal(data["deductions_pro_rata_max"][key])
-
-
-@router.callback_query(PayslipForm.deductions, F.data.startswith("ded_edit:"))
-async def handle_deduction_edit_cb(callback: CallbackQuery, state: FSMContext) -> None:
-    """User tapped ✏️ on a selected deduction — transform message into an edit prompt."""
-    await callback.answer()
-    key = callback.data.split(":")[1]
-    data = await state.get_data()
-    max_amount = _max_for_key(key, data)
-    label, _ = _DEDUCTION_META.get(key, ("כלכלה", config.DEDUCTION_FOOD_MAX))
-
-    # Build pro-rata hint for partial months with a stored contract value
-    prorata_suggested: Decimal | None = None
-    prorata_hint = ""
-    days_worked: int = data.get("days_worked", 26)
-    base_val = data.get(f"base_{key}")  # e.g. "base_housing"
-
-    if key in _DEDUCTION_META and base_val is not None and float(base_val) > 0 and days_worked < 26:
-        prorata_suggested = (
-            Decimal(str(base_val)) * Decimal(days_worked) / Decimal(26)
-        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        prorata_hint = (
-            f"\n\n💡 לפי החוזה שלך הניכוי הוא ₪{float(base_val):,.2f}. "
-            f"מכיוון שהעובד עבד החודש יחס של {days_worked}/26 ימי עבודה, "
-            f"הסכום היחסי המותר לניכוי הוא ₪{prorata_suggested:,.2f}."
-        )
-
-    await state.update_data(
-        deduction_edit_key=key,
-        deduction_edit_chat_id=callback.message.chat.id,  # type: ignore[union-attr]
-        deduction_edit_msg_id=callback.message.message_id,  # type: ignore[union-attr]
-        deduction_prorata_suggested=str(prorata_suggested) if prorata_suggested is not None else None,
-    )
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        f"✏️ *עריכת ניכוי — {label}*\n\n"
-        f"הזן סכום חדש (מקסימום: ₪{max_amount:,.2f}):{prorata_hint}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_deduction_edit_kb(max_amount, prorata_suggested),
-    )
-    await state.set_state(PayslipForm.deduction_edit)
-
-
-async def _finish_deduction_edit(state: FSMContext, amount: Decimal, bot: Bot) -> None:
-    """Save the edited amount and restore the full deductions keyboard in-place."""
-    data = await state.get_data()
-    key: str = data["deduction_edit_key"]
-    chat_id: int = data["deduction_edit_chat_id"]
-    msg_id: int = data["deduction_edit_msg_id"]
-    amounts: dict[str, str] = data["deductions_amounts"]
-    amounts[key] = str(amount)
-    sel: dict[str, bool] = data["deductions_selected"]
-
-    await state.update_data(
-        deductions_amounts=amounts,
-        deduction_edit_key=None,
-        deduction_edit_chat_id=None,
-        deduction_edit_msg_id=None,
-    )
-    await bot.edit_message_text(
-        chat_id=chat_id,
-        message_id=msg_id,
-        text=(
-            "אילו *ניכויים מותרים* מנוכים מהשכר החודש?\n"
-            "_(לחץ לסימון/ביטול. לחץ ✏️ לשינוי הסכום. לחץ סיום בסיום הבחירה)_\n\n"
-            "⚠️ ניכויים מותרים דורשים הסכמת העובד בכתב (נספח ג׳ לחוזה)."
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_deductions_kb(sel, amounts),
-    )
-    await state.set_state(PayslipForm.deductions)
-
-
-@router.callback_query(PayslipForm.deduction_edit, F.data == "ded_editpick:prorata")
-async def handle_deduction_prorata_pick(
-    callback: CallbackQuery, state: FSMContext, bot: Bot
-) -> None:
-    """User tapped the pro-rata quick-fill button — use the stored suggested amount."""
-    await callback.answer()
-    data = await state.get_data()
-    suggested_str = data.get("deduction_prorata_suggested") or "0"
-    await _finish_deduction_edit(state, Decimal(suggested_str), bot)
-
-
-@router.callback_query(PayslipForm.deduction_edit, F.data.startswith("ded_editpick:"))
-async def handle_deduction_editpick(
-    callback: CallbackQuery, state: FSMContext, bot: Bot
-) -> None:
-    """User tapped the max-amount quick-pick while in edit mode."""
-    await callback.answer()
-    amount = Decimal(callback.data.split(":", 1)[1])
-    await _finish_deduction_edit(state, amount, bot)
-
-
-@router.callback_query(PayslipForm.deduction_edit, F.data == "ded_editcancel")
-async def handle_deduction_editcancel(
-    callback: CallbackQuery, state: FSMContext, bot: Bot
-) -> None:
-    """User cancelled editing — restore the keyboard without changing the amount."""
-    await callback.answer()
-    data = await state.get_data()
-    key: str = data["deduction_edit_key"]
-    amounts: dict[str, str] = data["deductions_amounts"]
-    await _finish_deduction_edit(state, Decimal(amounts.get(key, "0")), bot)
-
-
-@router.message(PayslipForm.deduction_edit)
-async def handle_deduction_edit_text(
-    message: Message, state: FSMContext, bot: Bot
-) -> None:
-    """User typed a custom amount while in edit mode — validate then restore keyboard."""
-    data = await state.get_data()
-    key: str = data["deduction_edit_key"]
-    label, _ = _DEDUCTION_META.get(key, ("כלכלה", config.DEDUCTION_FOOD_MAX))
-    max_amount = _max_for_key(key, data)
-
-    val = _parse_decimal(message.text or "")
-    if val is None or val < 0:
-        await _invalid(message, f"נא להזין סכום חיובי עד ₪{max_amount:,.2f}.")
-        return
-    if val > max_amount:
-        await _invalid(
-            message,
-            f"הסכום ₪{val:,.2f} עולה על המקסימום המותר ({label}: ₪{max_amount:,.2f}).",
-        )
-        return
-
-    await _finish_deduction_edit(state, val, bot)
+# ARCHITECTURE NOTE (Detailed Mode — Simple Mode bypass):
+# The deductions multi-select flow (PayslipForm.deductions, PayslipForm.deduction_edit)
+# and all associated handlers (handle_deductions, _max_for_key, handle_deduction_edit_cb,
+# _finish_deduction_edit, handle_deduction_prorata_pick, handle_deduction_editpick,
+# handle_deduction_editcancel, handle_deduction_edit_text) have been removed for Simple Mode.
+# In Simple Mode the user is only asked for cash advances (PayslipForm.advances),
+# which then goes directly to _show_confirm().
+# Re-enable all of the above for Detailed Mode.
 
 
 # ── Helpers: build input, show confirm ────────────────────────────────────────
 
 def _build_payslip_input(data: dict) -> PayslipInput:
     """Assemble PayslipInput from accumulated FSM state data."""
-    sel: dict[str, bool] = data.get("deductions_selected", {})
-    amounts: dict[str, str] = data.get("deductions_amounts", {})
-
-    def _deduction(key: str) -> Decimal:
-        if not sel.get(key):
-            return Decimal("0")
-        stored = amounts.get(key)
-        return Decimal(stored) if stored is not None else Decimal("0")
-
     return PayslipInput(
         month=data["month"],
         year=data["year"],
@@ -1794,14 +1479,22 @@ def _build_payslip_input(data: dict) -> PayslipInput:
         employer_name=data.get("employer_name", _SKIPPED),
         caregiver_name=data.get("caregiver_name", _SKIPPED),
         passport_number=data.get("passport", _SKIPPED),
-        shabbat_days=data["shabbat_days"],
-        holiday_days=data["holiday_days"],
-        deduction_housing=_deduction("housing"),
-        deduction_health=_deduction("health"),
-        deduction_extras=_deduction("extras"),
-        deduction_food=_deduction("food"),
-        pocket_money_weeks=data["pocket_money_weeks"],
+        shabbat_days=int(data.get("shabbat_days") or 0),
+        holiday_days=int(data.get("holiday_days") or 0),
+        # ARCHITECTURE NOTE (Simple Mode): pocket_money_weeks and individual
+        # deductions are bypassed — set to 0. Re-enable for Detailed Mode.
+        pocket_money_weeks=0,
+        deduction_housing=Decimal("0"),
+        deduction_health=Decimal("0"),
+        deduction_extras=Decimal("0"),
+        deduction_food=Decimal("0"),
         advances=Decimal(data.get("advances", "0")),
+        # net_salary_override: agreed monthly net salary from /setup.
+        # Causes calculator to use this as the pro-rata basis instead of legal min wage.
+        net_salary_override=Decimal(data.get("agreed_net_salary") or "0"),
+        # active_days: calendar days employed — used for social-benefit accrual ratio.
+        # 0 for full months (calculator uses ratio=1.0); set by partial-month handlers.
+        active_days=int(data.get("active_days") or 0),
     )
 
 
@@ -1835,31 +1528,27 @@ async def _show_confirm(message: Message, state: FSMContext) -> None:
         lines.append(f"👤 מטפל/ת: {data['caregiver_name']}")
     lines.append(f"📆 ימי עבודה: {days_label}\n")
 
-    lines.append("💰 *הכנסות:*")
-    lines.append(f"  שכר בסיס: ₪{result.gross_base:,.2f}")
-    if result.pocket_money_total:
-        lines.append(f"  דמי כיס: ₪{result.pocket_money_total:,.2f}")
-    if result.shabbat_addition:
-        lines.append(f"  שבתות ({result.shabbat_days}): ₪{result.shabbat_addition:,.2f}")
-    if result.holiday_addition:
-        lines.append(f"  חגים ({result.holiday_days}): ₪{result.holiday_addition:,.2f}")
-    lines.append(f"  *סה״כ ברוטו: ₪{result.total_gross:,.2f}*\n")
+    lines.append("💰 *שכר:*")
+    lines.append(f"  שכר יסוד: ₪{result.gross_base:,.2f}")
+    if result.shabbat_addition > 0:
+        _rdk2 = (data.get("saved_data") or {}).get("rest_day") or data.get("rest_day") or config.DEFAULT_REST_DAY
+        rest_label = config.rest_day_hebrew(_rdk2)
+        lines.append(f"  תוספת {rest_label} ({result.shabbat_days} ימים): ₪{result.shabbat_addition:,.2f}")
+    if result.holiday_addition > 0:
+        lines.append(f"  תוספת חג ({result.holiday_days} ימים): ₪{result.holiday_addition:,.2f}")
+    if result.shabbat_addition > 0 or result.holiday_addition > 0:
+        lines.append(f"  *סה״כ שכר: ₪{result.total_gross:,.2f}*")
 
-    if result.total_deductions > 0:
-        lines.append("➖ *ניכויים:*")
-        if result.deduction_housing:
-            lines.append(f"  מגורים: ₪{result.deduction_housing:,.2f}")
-        if result.deduction_health:
-            lines.append(f"  ביטוח רפואי: ₪{result.deduction_health:,.2f}")
-        if result.deduction_extras:
-            lines.append(f"  הוצאות נלוות: ₪{result.deduction_extras:,.2f}")
-        if result.deduction_food:
-            lines.append(f"  כלכלה: ₪{result.deduction_food:,.2f}")
-        if result.advances:
-            lines.append(f"  מקדמות: ₪{result.advances:,.2f}")
+    if result.advances > 0:
+        lines.append(f"\n➖ *ניכויים:*")
+        lines.append(f"  מקדמות: ₪{result.advances:,.2f}")
         lines.append(f"  *סה״כ ניכויים: ₪{result.total_deductions:,.2f}*\n")
 
-    lines.append(f"💳 *סה״כ לתשלום: ₪{result.total_net_pay:,.2f}*")
+    lines.append(f"\n💳 *יתרה לתשלום בהעברה: ₪{result.total_net_pay:,.2f}*")
+
+    lines.append(f"\n📅 *צבירה לתלוש זה בלבד:*")
+    lines.append(f"  חופשה: +{result.vacation_accrued:.2f} ימים")
+    lines.append(f"  מחלה: +{result.sick_accrued:.2f} ימים")
 
     await message.answer(
         "\n".join(lines),
@@ -1875,7 +1564,10 @@ async def _show_confirm(message: Message, state: FSMContext) -> None:
 async def handle_confirm(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     action = callback.data.split(":")[1]
-    await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
+    except TelegramBadRequest:
+        pass  # buttons already gone — safe to continue
 
     if action == "restart":
         await state.clear()
@@ -1914,7 +1606,12 @@ async def _generate_and_send(message: Message, state: FSMContext) -> None:
         database.upsert_user(user_id, result.employer_name, result.caregiver_name)
     )
     db_balances = asyncio.create_task(
-        database.add_to_balances(user_id, result.vacation_accrued, result.sick_accrued)
+        database.upsert_month_accrual(
+            user_id,
+            f"{result.year}-{result.month:02d}",
+            result.vacation_accrued,
+            result.sick_accrued,
+        )
     )
 
     await message.answer("⏳ מפיק את התלוש…")
@@ -1947,10 +1644,8 @@ async def _generate_and_send(message: Message, state: FSMContext) -> None:
 
     # Show updated balance (best-effort; skipped if Firestore unavailable)
     try:
-        updated = await database.get_user(user_id)
-        if updated:
-            vac = updated.get("vacation_balance", 0.0)
-            sick = updated.get("sick_balance", 0.0)
+        vac, sick = await database.get_balances(user_id)
+        if vac or sick:
             await message.answer(
                 f"✅ *יתרה עדכנית:* {vac:.2f} ימי חופשה | {sick:.2f} ימי מחלה",
                 parse_mode=ParseMode.MARKDOWN,
