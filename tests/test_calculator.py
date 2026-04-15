@@ -39,6 +39,7 @@ def make_input(**overrides) -> PayslipInput:
         deduction_food=Decimal("0"),
         pocket_money_weeks=0,
         advances=Decimal("0"),
+        net_salary_override=Decimal("0"),  # 0 = use standard min-wage flow (Detailed Mode)
     )
     defaults.update(overrides)
     return PayslipInput(**defaults)
@@ -286,33 +287,232 @@ class TestPartialDayCalculation:
         assert dw == 26
 
     def test_started_day15_february(self):
-        """Start day 15, Feb (28 days): 14 active → round(14/28 × 26) = 13."""
+        """Start day 15, Feb (28 days): Feb 15-28 has Saturdays on 21,28 → 14-2=12 working days."""
         active, dw = calculate_partial_days("started", 15, 2, 2026)
         assert active == 14
-        assert dw == 13
+        assert dw == 12
 
     def test_ended_day14_february(self):
-        """End day 14, Feb (28 days): 14 active → round(14/28 × 26) = 13."""
+        """End day 14, Feb (28 days): Feb 1-14 has Saturdays on 7,14 → 14-2=12 working days."""
         active, dw = calculate_partial_days("ended", 14, 2, 2026)
         assert active == 14
-        assert dw == 13
+        assert dw == 12
 
     # ── March 2026 — 31 days ──────────────────────────────────────────────────
 
     def test_started_day16_march(self):
-        """Start day 16, March (31 days): 16 active → round(16/31 × 26) = 13."""
+        """Start day 16, March (31 days): Mar 16-31 has Saturdays on 21,28 → 16-2=14 working days."""
         active, dw = calculate_partial_days("started", 16, 3, 2026)
         assert active == 16
-        assert dw == 13
+        assert dw == 14
 
     def test_started_last_day_march_clamps_to_1(self):
-        """Starting on day 31 of March: 1 active day → days_worked = 1."""
+        """Starting on day 31 of March: 1 active day (Tuesday) → days_worked = 1."""
         active, dw = calculate_partial_days("started", 31, 3, 2026)
         assert active == 1
         assert dw == 1
 
     def test_ended_day16_march(self):
-        """End day 16, March (31 days): 16 active → round(16/31 × 26) = 13."""
+        """End day 16, March (31 days): Mar 1-16 has Saturdays on 7,14 → 16-2=14 working days."""
         active, dw = calculate_partial_days("ended", 16, 3, 2026)
         assert active == 16
+        assert dw == 14
+
+
+# ── Case F: Simple Mode — net_salary_override ─────────────────────────────────
+#
+# When net_salary_override > 0, gross_base is derived from the agreed net salary
+# instead of the legal minimum wage. All bypassed fields (shabbat, pocket_money,
+# individual deductions) are 0.
+
+class TestSimpleModeNetSalaryOverride:
+    def test_full_month_no_advances(self):
+        """Agreed net 6000, full month, 0 advances → net pay = 6000."""
+        result = calculate(make_input(net_salary_override=Decimal("6000")))
+        assert result.gross_base == Decimal("6000.00")
+        assert result.total_gross == Decimal("6000.00")
+        assert result.total_net_pay == Decimal("6000.00")
+
+    def test_full_month_with_advances(self):
+        """Agreed net 6000, full month, 500 advances → net pay = 5500."""
+        result = calculate(make_input(
+            net_salary_override=Decimal("6000"),
+            advances=Decimal("500"),
+        ))
+        assert result.gross_base == Decimal("6000.00")
+        assert result.total_deductions == Decimal("500")
+        assert result.total_net_pay == Decimal("5500.00")
+
+    def test_partial_month_half_days(self):
+        """Agreed net 6000, 13 days worked → gross ≈ 3000, net = 3000."""
+        result = calculate(make_input(
+            net_salary_override=Decimal("6000"),
+            days_worked=13,
+            is_full_month=False,
+        ))
+        expected = (Decimal("6000") * Decimal("13") / Decimal("26")).quantize(Decimal("0.01"))
+        assert result.gross_base == expected
+        assert result.total_net_pay == expected
+
+    def test_override_ignores_legal_min_wage(self):
+        """When override is set, gross_base should differ from legal min_wage × ratio."""
+        result = calculate(make_input(net_salary_override=Decimal("4000")))
+        assert result.gross_base == Decimal("4000.00")
+        # Legal min wage for April 2026 is 6443.85 — gross_base must NOT equal it
+        assert result.gross_base != Decimal("6443.85")
+
+
+# ── Case G: Rest-day variants in calculate_partial_days ──────────────────────
+#
+# April 2026, started day 12.  Active calendar days = 19.
+#
+# Saturday (5): Apr 18, 25          → 2 rest days → working = 17
+# Friday   (4): Apr 17, 24          → 2 rest days → working = 17  (same count, different days)
+# Sunday   (6): Apr 12, 19, 26      → 3 rest days → working = 16
+#
+# This verifies that the rest_day_weekday parameter is actually used.
+
+class TestRestDayVariants:
+    def test_saturday_default(self):
+        """Default rest day (Saturday) gives 17 for April 12-30."""
+        _, dw = calculate_partial_days("started", 12, 4, 2026)
+        assert dw == 17
+
+    def test_saturday_explicit(self):
+        """Explicit Saturday matches the default."""
+        _, dw = calculate_partial_days("started", 12, 4, 2026, rest_day_weekday=5)
+        assert dw == 17
+
+    def test_friday_rest_day(self):
+        """Friday rest day: Apr 17, 24 are Fridays → 19-2=17 working days."""
+        _, dw = calculate_partial_days("started", 12, 4, 2026, rest_day_weekday=4)
+        assert dw == 17
+
+    def test_sunday_rest_day(self):
+        """Sunday rest day: Apr 12, 19, 26 are Sundays → 19-3=16 working days."""
+        _, dw = calculate_partial_days("started", 12, 4, 2026, rest_day_weekday=6)
+        assert dw == 16
+
+    def test_full_month_always_26_regardless_of_rest_day(self):
+        """Full month always returns 26 no matter which day is the rest day."""
+        for wd in (4, 5, 6):
+            _, dw = calculate_partial_days("started", 1, 4, 2026, rest_day_weekday=wd)
+            assert dw == 26, f"rest_day_weekday={wd} should still give 26 for full month"
+
+    def test_friday_ended_mid_month(self):
+        """Ended day 15, April, Friday rest: Apr 3, 10 are Fridays → 15-2=13 working days."""
+        _, dw = calculate_partial_days("ended", 15, 4, 2026, rest_day_weekday=4)
+        assert dw == 13   # Apr 1-15: Fridays on 3rd and 10th = 2 rest days
+
+    def test_sunday_ended_mid_month(self):
+        """Ended day 15, April, Sunday rest: Apr 5, 12 are Sundays → 15-2=13."""
+        _, dw = calculate_partial_days("ended", 15, 4, 2026, rest_day_weekday=6)
         assert dw == 13
+
+
+# ── Case H: config rest-day helpers ──────────────────────────────────────────
+
+import config as _config
+
+
+class TestRestDayConfig:
+    def test_weekday_saturday(self):
+        assert _config.rest_day_weekday("saturday") == 5
+
+    def test_weekday_friday(self):
+        assert _config.rest_day_weekday("friday") == 4
+
+    def test_weekday_sunday(self):
+        assert _config.rest_day_weekday("sunday") == 6
+
+    def test_weekday_unknown_falls_back_to_saturday(self):
+        assert _config.rest_day_weekday("monday") == 5
+
+    def test_hebrew_saturday(self):
+        assert _config.rest_day_hebrew("saturday") == "שבת"
+
+    def test_hebrew_friday(self):
+        assert _config.rest_day_hebrew("friday") == "שישי"
+
+    def test_hebrew_sunday(self):
+        assert _config.rest_day_hebrew("sunday") == "ראשון"
+
+    def test_default_is_saturday(self):
+        assert _config.DEFAULT_REST_DAY == "saturday"
+
+
+# ── Case I: Calendar-ratio accrual for partial months ────────────────────────
+#
+# Social benefits (vacation, sick) must accrue based on calendar days of
+# employment (active_days / days_in_month), not working days (days_worked / 26).
+# Salary calculation is unchanged — it still uses days_worked / 26.
+#
+# Example: April 2026 (30 days), started day 12.
+#   active_days = 19, days_worked = 17
+#   salary ratio  = 17/26   ← gross_base
+#   accrual ratio = 19/30   ← vacation_accrued, sick_accrued
+#
+# This distinction matters because rest days are still days of employment —
+# the worker is in an employment relationship on those days even though they
+# are not working.
+
+class TestCalendarRatioAccrual:
+    # April 2026: 30 days. Started day 12 → active=19, worked=17.
+    ACTIVE = 19
+    DAYS_IN_MONTH = 30
+    DAYS_WORKED = 17
+    SALARY_RATIO  = Decimal("17") / Decimal("26")
+    ACCRUAL_RATIO = Decimal("19") / Decimal("30")
+
+    def _inp(self, **kw):
+        return make_input(
+            month=4,
+            year=2026,
+            is_full_month=False,
+            days_worked=self.DAYS_WORKED,
+            active_days=self.ACTIVE,
+            **kw,
+        )
+
+    def test_salary_still_uses_working_day_ratio(self):
+        """gross_base must still be derived from days_worked / 26."""
+        result = calculate(self._inp())
+        expected = (Decimal("6443.85") * self.SALARY_RATIO).quantize(Decimal("0.01"))
+        assert result.gross_base == expected
+
+    def test_vacation_uses_calendar_ratio(self):
+        """vacation_accrued = 1.16 × (active_days / days_in_month)."""
+        result = calculate(self._inp())
+        expected = (Decimal("1.16") * self.ACCRUAL_RATIO).quantize(Decimal("0.01"))
+        assert result.vacation_accrued == expected
+
+    def test_sick_uses_calendar_ratio(self):
+        """sick_accrued = 1.50 × (active_days / days_in_month)."""
+        result = calculate(self._inp())
+        expected = (Decimal("1.50") * self.ACCRUAL_RATIO).quantize(Decimal("0.01"))
+        assert result.sick_accrued == expected
+
+    def test_vacation_calendar_differs_from_working_day_ratio(self):
+        """Sanity: the two ratios must produce different values for this period."""
+        calendar_result = calculate(self._inp())
+        working_result  = calculate(make_input(
+            month=4, year=2026, is_full_month=False,
+            days_worked=self.DAYS_WORKED,
+            # active_days=0 → falls back to working-day ratio
+        ))
+        assert calendar_result.vacation_accrued != working_result.vacation_accrued
+
+    def test_full_month_unaffected(self):
+        """Full month: active_days == days_in_month → ratio = 1.0 → 1.16 / 1.50."""
+        result = calculate(make_input(
+            month=4, year=2026, is_full_month=True,
+            days_worked=26, active_days=30,
+        ))
+        assert result.vacation_accrued == Decimal("1.16")
+        assert result.sick_accrued     == Decimal("1.50")
+
+    def test_simple_mode_calendar_accrual(self):
+        """Simple Mode (net_salary_override) also uses calendar ratio for accruals."""
+        result = calculate(self._inp(net_salary_override=Decimal("5989")))
+        expected_vac = (Decimal("1.16") * self.ACCRUAL_RATIO).quantize(Decimal("0.01"))
+        assert result.vacation_accrued == expected_vac

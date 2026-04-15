@@ -50,6 +50,10 @@ def get_wage_params(month: int, year: int) -> tuple[Decimal, Decimal]:
 
 
 # ── Housing Deduction Caps by Region — April 2026 (employer-owned property) ───
+# ARCHITECTURE NOTE: These constants are part of the Detailed Mode infrastructure.
+# Simple Mode bypasses individual deductions by asking for the agreed monthly net
+# salary instead, and passes 0 for all deduction fields.
+# Do NOT remove — required for future Detailed Mode re-enablement.
 # Source: siud.pirsuma.com/calc_nikuyim/
 # These are the "owned by employer" caps. Rented property caps are exactly 2×.
 HOUSING_CAPS_OWNED: dict[str, Decimal] = {
@@ -85,6 +89,28 @@ SICK_DAYS_PER_MONTH = Decimal("1.50")      # 18 sick days ÷ 12
 # ── Calculation Basis ──────────────────────────────────────────────────────────
 WORKING_DAYS_MONTH = Decimal("26")         # 6 days/week × 4.33 weeks
 POCKET_MONEY_WEEKLY = Decimal("100")       # Standard דמי כיס per week (counts as salary)
+
+# ── Weekly Rest Day ───────────────────────────────────────────────────────────
+# Maps rest_day key (stored in Firestore) → (Hebrew label, Python weekday number).
+# Python weekday(): 0=Monday … 4=Friday, 5=Saturday, 6=Sunday.
+# Default is Saturday, matching the Israeli legal default for foreign caregivers.
+REST_DAY_OPTIONS: dict[str, tuple[str, int]] = {
+    "friday":   ("שישי",   4),
+    "saturday": ("שבת",    5),
+    "sunday":   ("ראשון",  6),
+}
+DEFAULT_REST_DAY = "saturday"
+
+
+def rest_day_weekday(rest_day: str) -> int:
+    """Return the Python weekday number for the given rest_day key."""
+    return REST_DAY_OPTIONS.get(rest_day, REST_DAY_OPTIONS[DEFAULT_REST_DAY])[1]
+
+
+def rest_day_hebrew(rest_day: str) -> str:
+    """Return the Hebrew label for the given rest_day key."""
+    return REST_DAY_OPTIONS.get(rest_day, REST_DAY_OPTIONS[DEFAULT_REST_DAY])[0]
+
 
 # ── Hebrew Month Names ─────────────────────────────────────────────────────────
 HEBREW_MONTHS: dict[int, str] = {

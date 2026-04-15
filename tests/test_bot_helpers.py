@@ -1,16 +1,14 @@
 """
-Integration tests for bot.py helper functions.
+Integration tests for bot.py helper functions — Simple Mode.
 
-Recreates the exact conversation from 13/04/2026 23:52 that caused the bot to get
-stuck after asking for the housing deduction amount.
+Recreates the exact conversation scenario from 13/04/2026 that first exposed
+an FSM issue (partial month, started day 12, employer "מלכה").
 
-Scenario:
-  - April 2026, partial month — started day 12
-  - active days = 30 - 12 + 1 = 19  →  days_worked = round(19/30 × 26) = 16
-  - employer: "מלכה", caregiver: skipped, passport: skipped
-  - shabbat=0, holiday=0, pocket_money=0, advances=0
-  - housing deduction selected; amount entered = 118.65 (pro-rata max)
-  - no food deduction
+ARCHITECTURE NOTE: This test file was updated for Simple Mode. The original
+version tested the deduction multi-select flow (housing/health/extras/food).
+That flow is currently bypassed — the bot now asks only for the agreed monthly
+net salary (in /setup) and cash advances (per payslip). The Detailed Mode
+infrastructure is preserved in bot.py / calculator.py for future re-enablement.
 
 Run with:
     pytest tests/test_bot_helpers.py -v
@@ -26,50 +24,39 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test_token_for_tests")
 
 import config
-from bot import _DEDUCTION_META, _SKIPPED, _build_payslip_input
+from bot import _SKIPPED, _build_payslip_input
 from calculator import PayslipInput, calculate, calculate_partial_days
+
+# Agreed net salary used throughout this scenario (₪/month)
+_AGREED_NET = Decimal("5989")
 
 
 # ── Shared fixture ─────────────────────────────────────────────────────────────
 
 def _make_fsm_data(**overrides) -> dict:
     """
-    Build a dict that mirrors the aiogram FSM state at the moment the user
-    has just entered the housing deduction amount and the bot is about to
-    call _show_confirm().
-    """
-    _, days_worked = calculate_partial_days("started", 12, 4, 2026)  # → 16
-    ratio = Decimal(days_worked) / Decimal("26")
+    Build a dict mirroring the aiogram FSM state just before _show_confirm().
 
-    pro_rata_max = {
-        k: str((cfg_max * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        for k, (_, cfg_max) in _DEDUCTION_META.items()
-    }
-    housing_max = Decimal(pro_rata_max["housing"])
+    Scenario: April 2026, partial month — started day 12.
+      active days = 30 - 12 + 1 = 19
+      Saturdays in Apr 12-30: 18th, 25th = 2 → days_worked = 19 - 2 = 17
+    """
+    active_days, days_worked = calculate_partial_days("started", 12, 4, 2026)  # → 19, 17
 
     data = {
         "month": 4,
         "year": 2026,
         "partial_type": "started",
+        "active_days": active_days,
         "days_worked": days_worked,
         "employer_name": "מלכה",
         "caregiver_name": _SKIPPED,
         "passport": _SKIPPED,
-        "shabbat_days": 0,
-        "holiday_days": 0,
-        "pocket_money_weeks": 0,
+        "shabbat_days": "0",
+        "holiday_days": "0",
+        "rest_day": "saturday",
+        "agreed_net_salary": str(_AGREED_NET),
         "advances": "0",
-        "deductions_selected": {
-            "housing": True,
-            "health": False,
-            "extras": False,
-            "food": False,
-        },
-        "deductions_pro_rata_max": pro_rata_max,
-        "deductions_amounts": {
-            **pro_rata_max,          # housing=118.65, health=104.00, extras=57.85
-            "food": "0",
-        },
     }
     data.update(overrides)
     return data
@@ -84,47 +71,51 @@ class TestPartialDayForScenario:
 
     def test_started_day12_april_days_worked(self):
         _, dw = calculate_partial_days("started", 12, 4, 2026)
-        assert dw == 16        # round(19/30 × 26) = round(16.47) = 16
+        assert dw == 17        # Apr 12-30: 19 calendar days - 2 Saturdays (18th, 25th) = 17
 
 
-# ── B: Verify pro-rata deduction maxima ───────────────────────────────────────
+# ── B: Verify deduction cap constants still exist (Detailed Mode infrastructure) ──
+# ARCHITECTURE NOTE: These tests validate that the legal cap constants are still
+# present in config.py and hold the correct April 2026 values. They are used by
+# Detailed Mode — do not remove them even though Simple Mode bypasses them.
 
-class TestProRataMaxima:
-    RATIO = Decimal("16") / Decimal("26")
+class TestDeductionCapConstants:
+    RATIO = Decimal("17") / Decimal("26")
+
+    def test_housing_cap_exists_and_correct(self):
+        assert config.DEDUCTION_HOUSING_MAX == Decimal("192.81")
+
+    def test_health_cap_exists_and_correct(self):
+        assert config.DEDUCTION_HEALTH_MAX == Decimal("169")
+
+    def test_extras_cap_exists_and_correct(self):
+        assert config.DEDUCTION_EXTRAS_MAX == Decimal("94")
 
     def test_housing_pro_rata_max(self):
         expected = (config.DEDUCTION_HOUSING_MAX * self.RATIO).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
-        assert expected == Decimal("118.65")
+        assert expected == Decimal("126.07")
 
     def test_health_pro_rata_max(self):
         expected = (config.DEDUCTION_HEALTH_MAX * self.RATIO).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
-        # 169 × 16/26 = 104.00 (exact)
-        assert expected == Decimal("104.00")
+        assert expected == Decimal("110.50")
 
     def test_extras_pro_rata_max(self):
         expected = (config.DEDUCTION_EXTRAS_MAX * self.RATIO).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
-        # 94 × 16/26 = 57.846… → 57.85
-        assert expected == Decimal("57.85")
-
-    def test_pro_rata_max_does_not_exceed_legal_max(self):
-        ratio = Decimal("16") / Decimal("26")
-        for key, (_, cfg_max) in _DEDUCTION_META.items():
-            pro_rata = (cfg_max * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            assert pro_rata <= cfg_max, f"{key}: {pro_rata} > {cfg_max}"
+        assert expected == Decimal("61.46")
 
 
-# ── C: _build_payslip_input with the stuck-scenario FSM data ──────────────────
+# ── C: _build_payslip_input — Simple Mode FSM data ────────────────────────────
 
 class TestBuildPayslipInput:
     def test_days_worked(self):
         inp = _build_payslip_input(_make_fsm_data())
-        assert inp.days_worked == 16
+        assert inp.days_worked == 17
 
     def test_employer_name_preserved(self):
         inp = _build_payslip_input(_make_fsm_data())
@@ -138,12 +129,15 @@ class TestBuildPayslipInput:
         inp = _build_payslip_input(_make_fsm_data())
         assert inp.passport_number == _SKIPPED
 
-    def test_housing_deduction_amount(self):
+    def test_net_salary_override_set(self):
+        """Simple Mode: net_salary_override carries the agreed net salary."""
         inp = _build_payslip_input(_make_fsm_data())
-        assert inp.deduction_housing == Decimal("118.65")
+        assert inp.net_salary_override == _AGREED_NET
 
-    def test_unselected_deductions_are_zero(self):
+    def test_all_individual_deductions_are_zero(self):
+        """Simple Mode: all itemized deduction fields are bypassed → 0."""
         inp = _build_payslip_input(_make_fsm_data())
+        assert inp.deduction_housing == Decimal("0")
         assert inp.deduction_health == Decimal("0")
         assert inp.deduction_extras == Decimal("0")
         assert inp.deduction_food == Decimal("0")
@@ -152,7 +146,24 @@ class TestBuildPayslipInput:
         inp = _build_payslip_input(_make_fsm_data())
         assert inp.advances == Decimal("0")
 
-    def test_pocket_money_zero(self):
+    def test_advances_non_zero(self):
+        inp = _build_payslip_input(_make_fsm_data(advances="300"))
+        assert inp.advances == Decimal("300")
+
+    def test_shabbat_days_zero_by_default(self):
+        inp = _build_payslip_input(_make_fsm_data())
+        assert inp.shabbat_days == 0
+
+    def test_shabbat_days_non_zero(self):
+        inp = _build_payslip_input(_make_fsm_data(shabbat_days="2"))
+        assert inp.shabbat_days == 2
+
+    def test_holiday_days_non_zero(self):
+        inp = _build_payslip_input(_make_fsm_data(holiday_days="1"))
+        assert inp.holiday_days == 1
+
+    def test_pocket_money_always_zero(self):
+        """pocket_money_weeks is bypassed in Simple Mode — always 0."""
         inp = _build_payslip_input(_make_fsm_data())
         assert inp.pocket_money_weeks == 0
 
@@ -161,32 +172,41 @@ class TestBuildPayslipInput:
         assert inp.is_full_month is False
 
 
-# ── D: calculate() with the stuck-scenario input ──────────────────────────────
+# ── D: calculate() with Simple Mode input ─────────────────────────────────────
 
 class TestCalculateForScenario:
+    RATIO         = Decimal("17") / Decimal("26")   # salary ratio (working days)
+    ACCRUAL_RATIO = Decimal("19") / Decimal("30")   # accrual ratio (calendar days, Apr 12-30)
+
     def setup_method(self):
         self.inp = _build_payslip_input(_make_fsm_data())
         self.result = calculate(self.inp)
 
-    def test_gross_base(self):
-        expected = (Decimal("6443.85") * Decimal("16") / Decimal("26")).quantize(
-            Decimal("0.01"), rounding=ROUND_HALF_UP
-        )
+    def test_gross_base_from_agreed_net(self):
+        """gross_base = agreed_net_salary × (days_worked / 26)."""
+        expected = (_AGREED_NET * self.RATIO).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         assert self.result.gross_base == expected
 
     def test_total_gross_equals_gross_base_no_additions(self):
-        # No pocket money, no shabbat, no holidays
+        """No shabbat/pocket_money → total_gross == gross_base."""
         assert self.result.total_gross == self.result.gross_base
 
-    def test_total_deductions(self):
-        assert self.result.total_deductions == Decimal("118.65")
+    def test_no_deductions(self):
+        """No individual deductions selected, no advances → total_deductions = 0."""
+        assert self.result.total_deductions == Decimal("0")
 
-    def test_net_pay(self):
-        assert self.result.total_net_pay == self.result.total_gross - Decimal("118.65")
+    def test_net_pay_equals_gross_when_no_advances(self):
+        assert self.result.total_net_pay == self.result.total_gross
+
+    def test_net_pay_with_advances(self):
+        inp = _build_payslip_input(_make_fsm_data(advances="200"))
+        result = calculate(inp)
+        assert result.total_net_pay == result.total_gross - Decimal("200")
 
     def test_deductions_under_25pct_cap(self):
-        ratio = self.result.total_deductions / self.result.total_gross
-        assert ratio <= Decimal("0.25")
+        if self.result.total_gross > 0:
+            ratio = self.result.total_deductions / self.result.total_gross
+            assert ratio <= Decimal("0.25")
 
     def test_employer_pension(self):
         expected = (self.result.gross_base * Decimal("0.065")).quantize(
@@ -195,23 +215,48 @@ class TestCalculateForScenario:
         assert self.result.employer_pension == expected
 
     def test_vacation_accrued(self):
-        expected = (Decimal("1.16") * Decimal("16") / Decimal("26")).quantize(
+        """vacation uses calendar ratio (active_days/days_in_month = 19/30), not salary ratio."""
+        expected = (Decimal("1.16") * self.ACCRUAL_RATIO).quantize(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
         assert self.result.vacation_accrued == expected
+
+    def test_shabbat_addition_two_days(self):
+        """2 rest days worked → shabbat_addition = 2 × shabbat_rate."""
+        from calculator import calculate as _calc
+        inp = _build_payslip_input(_make_fsm_data(shabbat_days="2"))
+        result = _calc(inp)
+        _, shabbat_rate = __import__("config").get_wage_params(4, 2026)
+        expected = (Decimal("2") * shabbat_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        assert result.shabbat_addition == expected
+
+    def test_total_gross_includes_shabbat_addition(self):
+        """total_gross = gross_base + shabbat_addition when rest days > 0."""
+        from calculator import calculate as _calc
+        inp = _build_payslip_input(_make_fsm_data(shabbat_days="2"))
+        result = _calc(inp)
+        assert result.total_gross == result.gross_base + result.shabbat_addition
+
+    def test_holiday_addition_one_day(self):
+        """1 holiday worked → holiday_addition = 1 × shabbat_rate."""
+        from calculator import calculate as _calc
+        inp = _build_payslip_input(_make_fsm_data(holiday_days="1"))
+        result = _calc(inp)
+        _, shabbat_rate = __import__("config").get_wage_params(4, 2026)
+        expected = shabbat_rate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        assert result.holiday_addition == expected
 
 
 # ── E: Confirm-summary text builds without exceptions ─────────────────────────
 
 class TestConfirmSummaryText:
     """
-    Replicate the exact string-building logic from _show_confirm() and assert
-    it produces a valid, non-empty summary string without raising any exception.
-    This isolates formatting bugs from Telegram API issues.
+    Replicate the _show_confirm() string-building logic and assert it produces
+    a valid, non-empty summary string without raising any exception.
     """
 
-    def _build_summary(self) -> str:
-        data = _make_fsm_data()
+    def _build_summary(self, **fsm_overrides) -> str:
+        data = _make_fsm_data(**fsm_overrides)
         result = calculate(_build_payslip_input(data))
 
         month_name = config.HEBREW_MONTHS[result.month]
@@ -229,52 +274,44 @@ class TestConfirmSummaryText:
             lines.append(f"👤 מטפל/ת: {data['caregiver_name']}")
         lines.append(f"📆 ימי עבודה: {days_label}\n")
 
-        lines.append("💰 *הכנסות:*")
-        lines.append(f"  שכר בסיס: ₪{result.gross_base:,.2f}")
-        if result.pocket_money_total:
-            lines.append(f"  דמי כיס: ₪{result.pocket_money_total:,.2f}")
-        if result.shabbat_addition:
-            lines.append(f"  שבתות ({result.shabbat_days}): ₪{result.shabbat_addition:,.2f}")
-        if result.holiday_addition:
-            lines.append(f"  חגים ({result.holiday_days}): ₪{result.holiday_addition:,.2f}")
-        lines.append(f"  *סה״כ ברוטו: ₪{result.total_gross:,.2f}*\n")
+        lines.append("💰 *שכר:*")
+        lines.append(f"  שכר יסוד: ₪{result.gross_base:,.2f}")
+        if result.shabbat_addition > 0:
+            lines.append(f"  תוספת שבת ({result.shabbat_days} ימים): ₪{result.shabbat_addition:,.2f}")
+        if result.holiday_addition > 0:
+            lines.append(f"  תוספת חג ({result.holiday_days} ימים): ₪{result.holiday_addition:,.2f}")
+        if result.shabbat_addition > 0 or result.holiday_addition > 0:
+            lines.append(f"  *סה״כ שכר: ₪{result.total_gross:,.2f}*")
 
-        if result.total_deductions > 0:
-            lines.append("➖ *ניכויים:*")
-            if result.deduction_housing:
-                lines.append(f"  מגורים: ₪{result.deduction_housing:,.2f}")
-            if result.deduction_health:
-                lines.append(f"  ביטוח רפואי: ₪{result.deduction_health:,.2f}")
-            if result.deduction_extras:
-                lines.append(f"  הוצאות נלוות: ₪{result.deduction_extras:,.2f}")
-            if result.deduction_food:
-                lines.append(f"  כלכלה: ₪{result.deduction_food:,.2f}")
-            if result.advances:
-                lines.append(f"  מקדמות: ₪{result.advances:,.2f}")
+        if result.advances > 0:
+            lines.append(f"\n➖ *ניכויים:*")
+            lines.append(f"  מקדמות: ₪{result.advances:,.2f}")
             lines.append(f"  *סה״כ ניכויים: ₪{result.total_deductions:,.2f}*\n")
 
-        lines.append(f"💳 *סה״כ לתשלום: ₪{result.total_net_pay:,.2f}*")
+        lines.append(f"\n💳 *יתרה לתשלום בהעברה: ₪{result.total_net_pay:,.2f}*")
 
         return "\n".join(lines)
 
     def test_summary_builds_without_exception(self):
-        summary = self._build_summary()
-        assert len(summary) > 0
+        assert len(self._build_summary()) > 0
 
     def test_summary_contains_employer(self):
         assert "מלכה" in self._build_summary()
 
-    def test_summary_contains_gross(self):
-        # gross_base = 3965.45
-        assert "3,965.45" in self._build_summary()
-
-    def test_summary_contains_housing_deduction(self):
-        assert "118.65" in self._build_summary()
-
-    def test_summary_contains_net_pay(self):
+    def test_summary_contains_gross_base(self):
         result = calculate(_build_payslip_input(_make_fsm_data()))
-        expected = f"{result.total_net_pay:,.2f}"
-        assert expected in self._build_summary()
+        assert f"{result.gross_base:,.2f}" in self._build_summary()
+
+    def test_summary_shows_advances_when_nonzero(self):
+        assert "300.00" in self._build_summary(advances="300")
+
+    def test_summary_no_advances_section_when_zero(self):
+        summary = self._build_summary(advances="0")
+        assert "מקדמות" not in summary
+
+    def test_net_pay_in_summary(self):
+        result = calculate(_build_payslip_input(_make_fsm_data()))
+        assert f"{result.total_net_pay:,.2f}" in self._build_summary()
 
     def test_no_unmatched_asterisks(self):
         """Unmatched * would cause Telegram Markdown parse errors."""

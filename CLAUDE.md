@@ -6,7 +6,7 @@ A Telegram bot for Israeli employers of foreign caregivers (עובד זר בסי
 
 **Data retention policy (nuanced):**
 - Passport numbers, salary figures, and PDF files → deleted immediately after sending (Zero-Data Retention)
-- Employer name, caregiver name, vacation balance, sick balance → stored in Firestore per user for UX convenience
+- Employer name, caregiver name, vacation/sick accruals → stored in Firestore per user for UX convenience
 - Users can delete their stored data with `/forget_me`
 
 Community open-source tool. Primary users: private individuals with no payroll background. The bot must be self-explanatory in Hebrew.
@@ -17,16 +17,18 @@ Community open-source tool. Primary users: private individuals with no payroll b
 
 | File | Responsibility |
 |---|---|
-| `config.py` | All legal constants, dynamic wage lookup, paths, env vars |
+| `config.py` | All legal constants, dynamic wage lookup, rest-day helpers, paths, env vars |
 | `calculator.py` | Pure math — no I/O, no Telegram, no PDF |
 | `pdf_generator.py` | ReportLab PDF only — receives a `PayslipResult`, returns a temp file path |
 | `bot.py` | aiogram v3 FSM, keyboards, user conversation, calls the other three |
 | `database.py` | Firestore async layer — get/upsert/balance/delete per user |
 | `scripts/download_fonts.py` | One-time font download; must work standalone |
 | `scripts/generate_sample.py` | Visual PDF inspection; does NOT delete the file (unlike bot.py) |
-| `tests/test_calculator.py` | 30 pytest unit tests; pure math, no mocking |
+| `tests/test_calculator.py` | Pure math unit tests |
+| `tests/test_bot_helpers.py` | Integration tests for bot helper functions |
+| `tests/test_setup_done_flow.py` | Tests for setup→start callback routing (user_id correctness) |
 
-Do not mix these concern׳קךךs. `calculator.py` must remain importable with no side effects.
+Do not mix these concerns. `calculator.py` must remain importable with no side effects.
 
 ---
 
@@ -47,6 +49,8 @@ finally:
 
 Never add logging that persists personal data (passport numbers, salary details). Never buffer or cache `PayslipResult` objects.
 
+Passport numbers are never stored in Firestore. The fast-track flow (when names are saved) auto-skips the passport question — `_SKIPPED` sentinel is used throughout.
+
 ---
 
 ## Firestore persistence (database.py)
@@ -55,16 +59,28 @@ Stores per-user data in collection `payslip_users`, document key = `str(telegram
 
 **Document schema:**
 ```
-employer_name:    str   # last used employer name
-caregiver_name:   str   # last used caregiver name
-vacation_balance: float # cumulative accrued vacation days across all payslips
-sick_balance:     float # cumulative accrued sick days across all payslips
+agreed_net_salary:     float   # agreed monthly net salary from /setup (Simple Mode)
+employer_name:         str     # last used employer name
+caregiver_name:        str     # last used caregiver name
+employment_start_date: str     # ISO "YYYY-MM-DD" — used for month-picker filtering
+rest_day:              str     # "saturday" | "friday" | "sunday" (default: "saturday")
+monthly_accruals:      map     # idempotent per-month accrual map
+  "YYYY-MM":
+    vacation: float            # vacation days accrued for that month (latest calculation)
+    sick:     float            # sick days accrued for that month (latest calculation)
 ```
+
+Balances are computed at read time by summing all `monthly_accruals` values — never stored as a flat total. Regenerating a payslip for the same month overwrites the same key, preventing double-counting.
+
+Legacy fields that may exist in old documents (ignored by current code):
+`vacation_balance`, `sick_balance`, `base_housing`, `base_health`, `base_extras`, `contract_region`, `contract_ownership`
 
 **Key rules:**
 - All functions degrade silently if Firestore is unavailable — bot still works without it
-- `upsert_user` uses `merge=True` so it never overwrites balances
-- `add_to_balances` uses `firestore.Increment` so it initialises to 0 on first write
+- `upsert_user` uses `merge=True` so it never overwrites other fields
+- `upsert_contract` writes `agreed_net_salary`, `employment_start_date`, and `rest_day`
+- `upsert_month_accrual` uses `update()` with dot-notation to touch only one month key; falls back to `set(merge=True)` on `NotFound` (new document)
+- `get_balances` sums the `monthly_accruals` map — returns `(0.0, 0.0)` if empty or unavailable
 - Skipped names (`"---"`) are never written to Firestore
 - `/forget_me` deletes the entire document
 
@@ -117,48 +133,85 @@ Current values (April 2026):
 
 ---
 
-## Calculation rules (don't get these wrong)
+## Calculation rules (Simple Mode — current)
 
-- `gross_base = min_wage × (days_worked / 26)` — 26 is the monthly working-day basis
-- Pocket money (דמי כיס) counts as salary, **100 ₪/week**, added to gross
-- Shabbat and holiday additions use `shabbat_rate`, not `daily_rate`
-- Housing, health, extras deductions are **pro-rated** for partial months (× days/26)
-- Food deduction (כלכלה) is **not pro-rated** — it reflects actual food provided
-- Employer pension and severance are informational only — they do **not** reduce net pay
-- Total deductions > 25% of gross → raise `ValueError` (legal hard limit)
+**Simple Mode** is the active mode. The bot asks for an agreed monthly net salary instead of computing gross from legal minimums and itemizing deductions.
+
+### Two ratios — do not confuse them
+
+| Ratio | Formula | Used for |
+|---|---|---|
+| Salary ratio | `days_worked / 26` | `gross_base` |
+| Accrual ratio | `active_days / days_in_month` | `vacation_accrued`, `sick_accrued` |
+
+`days_worked` counts non-rest-day calendar days in the period. `active_days` counts all calendar days (including rest days). For a full month both ratios equal 1. For partial months they differ.
+
+**Why different ratios?** Salary is paid for working days only. Social benefits accrue for every day the worker is in an employment relationship — rest days included. This matches Israeli labor law.
+
+### Summary
+
+- `gross_base = agreed_net_salary × (days_worked / 26)`
+- `shabbat_addition = shabbat_days × shabbat_rate` (added on top of gross_base)
+- `holiday_addition = holiday_days × shabbat_rate` (added on top)
+- Advances are the only per-payslip deduction
+- `net_pay = gross_base + shabbat_addition + holiday_addition − advances`
+- `vacation_accrued = 1.16 × (active_days / days_in_month)`
+- `sick_accrued = 1.50 × (active_days / days_in_month)`
+- Employer pension and severance are informational — they do **not** reduce net pay
+- The 25% deduction cap still applies (validation in calculator.py)
+
+**Detailed Mode infrastructure** is preserved in the code but bypassed. All bypassed fields are marked with `# ARCHITECTURE NOTE` comments. See `plans/simple-mode-agreed-net-salary.md` for re-enablement instructions.
 
 ---
 
-## FSM state order (bot.py)
+## Partial-month day calculation
+
+`calculate_partial_days(partial_type, day, month, year, rest_day_weekday=5) → (active_days, days_worked)`
+
+- `active_days`: count of calendar days in the period (e.g. Apr 12-30 = 19)
+- `days_worked`: count of non-rest-day days in the period (e.g. 19 − 2 Saturdays = 17)
+- Full month always returns `(days_in_month, 26)` regardless of rest day
+- Both values are stored in FSM state and passed to `PayslipInput`
+
+The rest day used for counting comes from the `rest_day` saved in Firestore / FSM state.
+
+---
+
+## FSM state order (bot.py) — Simple Mode
 
 ```
 /start
-  → (Firestore lookup — saves saved_data + user_id to FSM state)
-  → month_year      (quick-picker or MM/YYYY / MM/YY text)
-  → work_period     (inline: full / partial)
-  → days_worked     (only for partial)
-  → employer_name   (shows "use previous details" button if Firestore has saved names)
-      └─ use_saved  → skips caregiver_name, jumps to passport
-  → caregiver_name  (skipped if use_saved)
-  → passport
-  → shabbat_days
-  → holiday_days
-  → pocket_money_weeks
-  → advances
-  → deductions      (inline multi-select toggle)
-  → food_amount     (only if כלכלה selected)
-  → _generate_and_send()
-      → upsert names to Firestore (background task)
-      → increment balances in Firestore (background task)
+  → if no saved contract → show "הקלד /setup להתחלת ההגדרה" (redirect, do NOT embed setup)
+  → (Firestore lookup — loads agreed_net_salary + names + rest_day into FSM state)
+  → month_year        (quick-picker or MM/YYYY / MM/YY text)
+  → work_period       (inline: full / partial)
+                      [if start month matches employment_start_date → auto partial, skip work_period]
+  → days_worked       (only for explicit partial)
+  → details_confirm   (fast-track: if both names saved → show summary card with [✅ כן, המשך] / [✏️ עריכת פרטים])
+     OR employer_name → caregiver_name → passport  (if names not saved or user wants to edit)
+  → shabbat_days      ("כמה ימי {rest_day_label} עבד/ה?" — 0-button available)
+  → holiday_days      (0-button available)
+  → advances          ("מקדמות / דמי כיס ששולמו במזומן" — 0-button available)
+  → _show_confirm() → _generate_and_send()
+      → upsert names to Firestore
+      → upsert_month_accrual to Firestore
       → generate PDF → send → delete PDF
       → show updated vacation/sick balance
 ```
 
-Commands available at any time: `/start` (restart), `/forget_me` (delete Firestore data)
+**`/setup` wizard** (`ContractSetupForm`):
+```
+agreed_net_salary → start_date → rest_day → employer_name → caregiver_name → _complete_setup()
+  → shows settings summary + "📄 הפק תלוש עכשיו" button
+```
+
+**`/start` → `/setup` routing:**  `cmd_start` calls `_run_start_flow(message, state, user_id=message.from_user.id)`. The "הפק תלוש עכשיו" callback calls `_run_start_flow(..., user_id=callback.from_user.id)` — **never** `callback.message.from_user.id` (which would be the bot's own ID).
+
+Commands available at any time: `/start` (restart), `/setup` (update settings), `/forget_me` (delete Firestore data)
 
 The month picker shows prev/current/next month buttons (current pre-selected ✅), plus "📅 חודש אחר…" which falls back to text. Text input accepts `MM/YYYY` or `MM/YY` (2-digit year → `2000 + int(year)`).
 
-Both the callback path and text path share `_confirm_month_and_proceed()` — keep them in sync.
+Both the callback path and text path share `_confirm_month_and_proceed()` — keep them in sync. Both paths store both `active_days` and `days_worked` in FSM state.
 
 ---
 
@@ -178,7 +231,7 @@ python bot.py
 # Visual PDF check
 python scripts/generate_sample.py sample_payslip.pdf
 
-# Tests (30 tests, all must pass)
+# Tests (110 tests, all must pass)
 pytest tests/ -v
 ```
 
@@ -232,10 +285,10 @@ FSM uses `MemoryStorage` — mid-conversation state is lost on redeploy or if Cl
 
 ## What to test when making changes
 
-- `pytest tests/ -v` must stay at 30/30
+- `pytest tests/ -v` must stay at 110/110
 - After any `pdf_generator.py` change: run `generate_sample.py` and visually verify Hebrew RTL is correct and all numbers are visible
-- After any `calculator.py` change: verify April 2026 full month — gross_base = 6443.85, 4 shabbats = 4×439.73 = 1758.92, total_gross = 6443.85 + pocket_money + 1758.92
-- After any `bot.py` FSM change: trace the full conversation to confirm state transitions work for both full and partial months, with and without deductions, with and without saved Firestore data
+- After any `calculator.py` change: verify Simple Mode — `agreed_net=5989`, `days=26`, `advances=0` → `net=5989.00`; partial `days=17, active=19, month=Apr` → `vacation=1.16×19/30`
+- After any `bot.py` FSM change: trace the full conversation — `/setup` → "📄 הפק תלוש" → full month → 0 advances → confirm → PDF
 - After any `database.py` change: test graceful degradation (run without GCP credentials — bot must still generate PDFs)
 
 ---
@@ -245,9 +298,11 @@ FSM uses `MemoryStorage` — mid-conversation state is lost on redeploy or if Cl
 - Do not persist passport numbers, salary details, or PDF files
 - Do not cache `PayslipResult` or delay `state.clear()`
 - Do not pass numeric strings through `_h()` alone — use `_mixed_markup()` or `_amount_para()`
-- Do not hardcode a single minimum wage — always go through `get_wage_params(month, year)`
-- Do not pro-rate the food deduction (כלכלה)
+- Do not hardcode a single minimum wage — always go through `get_wage_params(month, year)` (used for employer pension/severance even in Simple Mode)
 - Do not subtract employer contributions from net pay
-- Do not add deductions without checking the 25% cap
 - Do not write `"---"` (the skipped-field sentinel) to Firestore
 - Do not let Firestore errors crash the bot — all `database.py` calls must be wrapped in try/except
+- Do not remove the `# ARCHITECTURE NOTE` code blocks in `bot.py` / `calculator.py` — they are the Detailed Mode infrastructure preserved for future use
+- Do not set `net_salary_override` to a non-zero value in tests that are validating standard min-wage behavior (it would bypass the legal calculation)
+- Do not use `active_days / days_in_month` for the salary/gross calculation — only for social benefit accrual
+- Do not call `cmd_start(callback.message, state)` from callback handlers — use `_run_start_flow(..., user_id=callback.from_user.id)` instead (`callback.message.from_user` is the bot, not the user)
