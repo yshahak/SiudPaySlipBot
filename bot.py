@@ -1348,35 +1348,67 @@ def _zero_kb(callback_data: str, label: str = "✅ לא עבד/ה (0)") -> Inlin
     return builder.as_markup()
 
 
+def _rest_day_count_kb(total: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for i in range(total + 1):
+        builder.button(text=str(i), callback_data=f"shabbat:count:{i}")
+    builder.adjust(total + 1)
+    return builder.as_markup()
+
+
 async def _ask_shabbat_days(message: Message, state: FSMContext) -> None:
     await state.set_state(PayslipForm.shabbat_days)
     data = await state.get_data()
     saved_s: dict = data.get("saved_data") or {}
     _rdk = saved_s.get("rest_day") or data.get("rest_day") or config.DEFAULT_REST_DAY
     rest_label = config.rest_day_hebrew(_rdk)
+    rest_weekday = config.rest_day_weekday(_rdk)
+
+    month: int = data["month"]
+    year: int = data["year"]
+    days_in_month = calendar.monthrange(year, month)[1]
+    active_days: int | None = data.get("active_days")
+    partial_type: str | None = data.get("partial_type")
+
+    if active_days and partial_type:
+        if partial_type == "started":
+            start_day = days_in_month - active_days + 1
+            end_day = days_in_month
+        else:
+            start_day, end_day = 1, active_days
+    else:
+        start_day, end_day = 1, days_in_month
+
+    total_rest = config.count_rest_days_in_period(month, year, start_day, end_day, rest_weekday)
+    await state.update_data(total_rest_days=total_rest)
+
     await message.answer(
-        f"כמה ימי *{rest_label}* עבד/ה המטפל/ת החודש?\n_(שכר יום מנוחה מתווסף לשכר היסוד)_",
+        f"מתוך *{total_rest} ימי {rest_label}* בחודש — כמה עבד/ה המטפל/ת?\n"
+        f"_(שכר יום מנוחה מתווסף לשכר היסוד)_",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_zero_kb("shabbat:zero"),
+        reply_markup=_rest_day_count_kb(total_rest),
     )
 
 
-@router.callback_query(PayslipForm.shabbat_days, F.data == "shabbat:zero")
-async def handle_shabbat_zero(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(PayslipForm.shabbat_days, F.data.startswith("shabbat:count:"))
+async def handle_shabbat_count(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
+    n = int(callback.data.split(":")[2])
     try:
         await callback.message.edit_reply_markup(reply_markup=None)  # type: ignore[union-attr]
     except TelegramBadRequest:
         pass
-    await state.update_data(shabbat_days="0")
+    await state.update_data(shabbat_days=str(n))
     await _ask_holiday_days(callback.message, state)  # type: ignore[arg-type]
 
 
 @router.message(PayslipForm.shabbat_days)
 async def handle_shabbat_days(message: Message, state: FSMContext) -> None:
     val = (message.text or "").strip()
-    if not val.isdigit() or int(val) < 0:
-        await _invalid(message, "נא להזין מספר שלם חיובי (לדוגמה: 0, 1, 2).")
+    data = await state.get_data()
+    total_rest: int = data.get("total_rest_days") or 5
+    if not val.isdigit() or int(val) < 0 or int(val) > total_rest:
+        await _invalid(message, f"נא להזין מספר בין 0 ל-{total_rest}.")
         return
     await state.update_data(shabbat_days=val)
     await _ask_holiday_days(message, state)

@@ -112,6 +112,16 @@ def rest_day_hebrew(rest_day: str) -> str:
     return REST_DAY_OPTIONS.get(rest_day, REST_DAY_OPTIONS[DEFAULT_REST_DAY])[0]
 
 
+def count_rest_days_in_period(
+    month: int, year: int, start_day: int, end_day: int, rest_day_weekday: int
+) -> int:
+    """Count how many rest days fall within [start_day, end_day] inclusive."""
+    return sum(
+        1 for d in range(start_day, end_day + 1)
+        if date(year, month, d).weekday() == rest_day_weekday
+    )
+
+
 # ── Hebrew Month Names ─────────────────────────────────────────────────────────
 HEBREW_MONTHS: dict[int, str] = {
     1: "ינואר", 2: "פברואר", 3: "מרץ", 4: "אפריל",
